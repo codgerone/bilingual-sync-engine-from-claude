@@ -1,0 +1,18 @@
+# 双语Word文档Track Changes同步引擎 - Python依赖
+
+# Anthropic Claude API
+anthropic>=0.18.0
+
+# XML处理 (安全的XML解析)
+defusedxml>=0.7.1
+
+# 可选：进度条显示
+tqdm>=4.65.0
+
+# 可选：日志记录
+loguru>=0.7.0
+
+# 注意：
+# 1. pandoc需要单独安装: sudo apt-get install pandoc
+# 2. Document library来自docx skill，不需要pip安装
+# 3. LibreOffice (可选，用于PDF转换): sudo apt-get install libreoffice
