@@ -4,8 +4,13 @@
 核心功能：
 1. 解析文档XML结构
 2. 识别<w:del>和<w:ins>标签
-3. 提取修订的上下文信息
+3. 提取修订前后的完整文本
 4. 组织成结构化数据
+
+V2 重塑说明：
+- 新增 extract_text_versions_from_column() 方法
+- 输出 before_text（修订前）和 after_text（修订后）
+- 删除 deletion/insertion 配对逻辑，让 LLM 理解语义差异
 """
 
 import re
@@ -15,11 +20,11 @@ from defusedxml import minidom
 
 class RevisionExtractor:
     """从Word文档中提取track changes信息"""
-    
+
     def __init__(self, unpacked_dir: str):
         """
         初始化提取器
-        
+
         Args:
             unpacked_dir: 解包后的文档目录路径
         """
@@ -73,7 +78,164 @@ class RevisionExtractor:
             revisions.extend(cell_revisions)
         
         return revisions
-    
+
+    # ========== V2 新方法：提取修订前后完整文本 ==========
+
+    def extract_text_versions_from_column(self, column_index: int = 0) -> List[Dict]:
+        """
+        从指定列提取每行的修订前后文本（V2 新方法）
+
+        Args:
+            column_index: 列索引 (0=左列, 1=右列)
+
+        Returns:
+            文本版本列表，每项包含：
+            {
+                'row_index': 行索引,
+                'before_text': 修订前完整文本（正常文本 + 删除文本）,
+                'after_text': 修订后完整文本（正常文本 + 插入文本）,
+                'has_revisions': 是否包含修订
+            }
+        """
+        with open(self.document_xml_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        dom = minidom.parseString(content)
+        rows = dom.getElementsByTagName('w:tr')
+
+        results = []
+
+        for row_idx, row in enumerate(rows):
+            cells = row.getElementsByTagName('w:tc')
+            if column_index >= len(cells):
+                continue
+
+            cell = cells[column_index]
+            before_text, after_text, has_revisions = self._extract_text_versions_from_cell(cell)
+
+            results.append({
+                'row_index': row_idx,
+                'before_text': before_text,
+                'after_text': after_text,
+                'has_revisions': has_revisions,
+            })
+
+        return results
+
+    def extract_clean_text_from_column(self, column_index: int = 0) -> List[Dict]:
+        """
+        从指定列提取纯净文本（用于目标语言列，假设无 track changes）
+
+        Args:
+            column_index: 列索引 (0=左列, 1=右列)
+
+        Returns:
+            文本列表，每项包含：
+            {
+                'row_index': 行索引,
+                'current_text': 当前纯净文本
+            }
+        """
+        with open(self.document_xml_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        dom = minidom.parseString(content)
+        rows = dom.getElementsByTagName('w:tr')
+
+        results = []
+
+        for row_idx, row in enumerate(rows):
+            cells = row.getElementsByTagName('w:tc')
+            if column_index >= len(cells):
+                continue
+
+            cell = cells[column_index]
+            current_text = self._extract_all_text_from_cell(cell)
+
+            results.append({
+                'row_index': row_idx,
+                'current_text': current_text,
+            })
+
+        return results
+
+    def _extract_text_versions_from_cell(self, cell) -> Tuple[str, str, bool]:
+        """
+        从单元格提取修订前后的完整文本
+
+        遍历单元格内所有节点，按顺序收集：
+        - <w:r> 普通文本 → before 和 after 都包含
+        - <w:del> 删除文本 → 只在 before 中
+        - <w:ins> 插入文本 → 只在 after 中
+
+        Returns:
+            (before_text, after_text, has_revisions)
+        """
+        before_parts = []
+        after_parts = []
+        has_revisions = False
+
+        paragraphs = cell.getElementsByTagName('w:p')
+
+        for para_idx, para in enumerate(paragraphs):
+            # 添加段落分隔（除了第一个段落）
+            if para_idx > 0:
+                before_parts.append('\n')
+                after_parts.append('\n')
+
+            # 遍历段落的直接子节点
+            for child in para.childNodes:
+                if child.nodeType != child.ELEMENT_NODE:
+                    continue
+
+                tag = child.tagName
+
+                if tag == 'w:r':
+                    # 普通文本节点 → 两个版本都包含
+                    text = self._extract_text_from_node(child)
+                    before_parts.append(text)
+                    after_parts.append(text)
+
+                elif tag == 'w:del':
+                    # 删除节点 → 只在 before 中
+                    text = self._extract_text_from_node(child)
+                    before_parts.append(text)
+                    has_revisions = True
+
+                elif tag == 'w:ins':
+                    # 插入节点 → 只在 after 中
+                    text = self._extract_text_from_node(child)
+                    after_parts.append(text)
+                    has_revisions = True
+
+        before_text = ''.join(before_parts)
+        after_text = ''.join(after_parts)
+
+        return before_text, after_text, has_revisions
+
+    def _extract_all_text_from_cell(self, cell) -> str:
+        """
+        从单元格提取所有可见文本（用于纯净文本列）
+
+        对于无 track changes 的列，直接提取所有 <w:t> 文本
+        """
+        text_parts = []
+        paragraphs = cell.getElementsByTagName('w:p')
+
+        for para_idx, para in enumerate(paragraphs):
+            if para_idx > 0:
+                text_parts.append('\n')
+
+            # 获取所有 w:t 节点
+            text_nodes = para.getElementsByTagName('w:t')
+            for t in text_nodes:
+                if t.firstChild:
+                    text_parts.append(t.firstChild.nodeValue)
+
+        return ''.join(text_parts)
+
+    # ========== V1 旧方法（保留以便对比和测试） ==========
+
     def _extract_revisions_from_cell(
         self, cell, row_idx: int, full_content: str
     ) -> List[Dict]:
@@ -239,12 +401,40 @@ def decode_html_entities(text: str) -> str:
 # 使用示例
 if __name__ == "__main__":
     extractor = RevisionExtractor("unpacked")
-    
-    # 从左列（中文列）提取修订
+
+    print("=" * 50)
+    print("V2 新方法：提取修订前后完整文本")
+    print("=" * 50)
+
+    # 从源语言列（中文列）提取修订前后文本
+    source_texts = extractor.extract_text_versions_from_column(column_index=0)
+
+    for item in source_texts:
+        if item['has_revisions']:
+            print(f"\n行 {item['row_index']}:")
+            print(f"  修订前: {decode_html_entities(item['before_text'])}")
+            print(f"  修订后: {decode_html_entities(item['after_text'])}")
+
+    # 从目标语言列（英文列）提取纯净文本
+    print("\n" + "=" * 50)
+    print("目标语言列纯净文本")
+    print("=" * 50)
+
+    target_texts = extractor.extract_clean_text_from_column(column_index=1)
+
+    for item in target_texts:
+        print(f"\n行 {item['row_index']}:")
+        print(f"  当前文本: {decode_html_entities(item['current_text'])}")
+
+    print("\n" + "=" * 50)
+    print("V1 旧方法（保留以便对比）")
+    print("=" * 50)
+
+    # V1 旧方法
     chinese_revisions = extractor.extract_revisions_from_column(column_index=0)
-    
+
     print(f"找到 {len(chinese_revisions)} 个修订")
-    
+
     for i, rev in enumerate(chinese_revisions, 1):
         print(f"\n修订 {i}:")
         print(f"  行: {rev['row_index']}")

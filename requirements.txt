@@ -6,6 +6,9 @@ anthropic>=0.18.0
 # XML处理 (安全的XML解析)
 defusedxml>=0.7.1
 
+# 中文分词 (V2 词级别 diff 需要)
+jieba>=0.42.1
+
 # 可选：进度条显示
 tqdm>=4.65.0
 

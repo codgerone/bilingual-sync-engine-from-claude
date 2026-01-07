@@ -2,6 +2,12 @@
 双语同步引擎主模块
 
 整合提取、映射、应用三个核心功能
+
+V2 重塑说明：
+- sync_v2() 使用新的语义驱动方案
+- extractor 输出 before_text/after_text
+- mapper 让 LLM 理解语义差异
+- applier 使用词级别 diff
 """
 
 import os
@@ -9,7 +15,7 @@ import subprocess
 from typing import List, Dict, Tuple
 from .extractor import RevisionExtractor, decode_html_entities
 from .mapper import RevisionMapper
-from .applier import SmartRevisionApplier
+from .applier import SmartRevisionApplier, DiffBasedApplier
 
 
 class BilingualSyncEngine:
@@ -159,9 +165,112 @@ class BilingualSyncEngine:
         print("同步完成！")
         print(f"输出文件: {output_path}")
         print("=" * 60)
-        
+
         return output_path
-    
+
+    # ========== V2 新方法：语义驱动的同步 ==========
+
+    def sync_v2(self, output_path: str = None) -> str:
+        """
+        执行 V2 版本的同步流程（语义驱动）
+
+        与 V1 的区别：
+        - 提取 before_text/after_text 而非 deletion/insertion
+        - LLM 理解语义差异，返回完整的 target_after
+        - 使用词级别 diff 生成 track changes
+
+        Args:
+            output_path: 输出文档路径，如果为None则自动生成
+
+        Returns:
+            输出文档的路径
+        """
+        print("=" * 60)
+        print("双语Word文档Track Changes同步引擎 (V2 语义驱动)")
+        print("=" * 60)
+
+        # 1. 解包文档
+        print("\n[1/7] 解包Word文档...")
+        self._unpack_document()
+
+        # 2. 初始化组件
+        print("[2/7] 初始化组件...")
+        self.extractor = RevisionExtractor(self.unpacked_dir)
+        self.applier = DiffBasedApplier(self.unpacked_dir, author=self.author)
+
+        # 3. 从源语言列提取修订前后文本
+        print(f"[3/7] 从{self.source_lang}列提取修订前后文本...")
+        source_texts = self.extractor.extract_text_versions_from_column(
+            self.source_column
+        )
+
+        # 过滤出有修订的行
+        revised_rows = [item for item in source_texts if item['has_revisions']]
+        print(f"  找到 {len(revised_rows)} 行有修订")
+
+        if not revised_rows:
+            print("  没有发现修订，退出")
+            return None
+
+        # 4. 从目标语言列提取纯净文本
+        print(f"[4/7] 从{self.target_lang}列提取文本...")
+        target_texts = self.extractor.extract_clean_text_from_column(
+            self.target_column
+        )
+
+        # 5. 使用 LLM 映射修订
+        print(f"[5/7] 使用 LLM 映射修订到{self.target_lang}...")
+
+        mapped_results = self.mapper.map_text_revisions_batch(
+            source_items=revised_rows,
+            target_items=target_texts,
+            source_lang=self.source_lang,
+            target_lang=self.target_lang
+        )
+
+        # 显示映射结果
+        for result in mapped_results:
+            row_idx = result.get('row_index')
+            print(f"\n  行 {row_idx}:")
+            print(f"    当前: {result.get('target_current', '')[:50]}...")
+            print(f"    修订后: {result.get('target_after', '')[:50]}...")
+            print(f"    置信度: {result.get('confidence', 'N/A')}")
+
+        # 6. 应用修订到目标语言列
+        print(f"\n[6/7] 应用修订到{self.target_lang}列...")
+
+        success_count = self.applier.apply_mapped_revisions(
+            mapped_results=mapped_results,
+            column_index=self.target_column
+        )
+
+        print(f"\n成功应用 {success_count}/{len(mapped_results)} 行修订")
+
+        # 7. 保存文档
+        print("\n保存修改...")
+        self.applier.save()
+
+        # 8. 打包文档
+        if output_path is None:
+            base, ext = os.path.splitext(self.docx_path)
+            output_path = f"{base}_synced_v2{ext}"
+
+        print(f"打包文档到: {output_path}")
+        self._pack_document(output_path)
+
+        # 9. 验证
+        print("\n[7/7] 验证结果...")
+        self._verify_output(output_path)
+
+        print("\n" + "=" * 60)
+        print("V2 同步完成！")
+        print(f"输出文件: {output_path}")
+        print("=" * 60)
+
+        return output_path
+
+    # ========== V1 旧方法保留在上面 ==========
+
     def _unpack_document(self):
         """解包Word文档"""
         os.makedirs(self.work_dir, exist_ok=True)
@@ -258,7 +367,7 @@ class BilingualSyncEngine:
 # 命令行接口
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="双语Word文档Track Changes同步引擎"
     )
@@ -301,9 +410,14 @@ def main():
         "--api-key",
         help="Anthropic API密钥（可选，也可通过环境变量设置）"
     )
-    
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help="使用 V2 语义驱动同步（推荐）"
+    )
+
     args = parser.parse_args()
-    
+
     # 创建引擎
     engine = BilingualSyncEngine(
         docx_path=args.input,
@@ -314,10 +428,15 @@ def main():
         target_lang=args.target_lang,
         author=args.author
     )
-    
+
     # 执行同步
-    output_path = engine.sync(args.output)
-    
+    if args.v2:
+        print("使用 V2 语义驱动同步方案")
+        output_path = engine.sync_v2(args.output)
+    else:
+        print("使用 V1 传统同步方案（添加 --v2 使用新方案）")
+        output_path = engine.sync(args.output)
+
     return output_path
 
 
