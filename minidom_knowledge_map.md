@@ -113,7 +113,50 @@ for t in text_nodes:
 
 ---
 
-## 6️⃣ 核心流程图（extractor.py 做了什么）
+## 6️⃣ ⚠️ 重要陷阱：空白字符也是文本节点！
+
+**问题：为什么 `element.firstChild` 经常不是你想要的元素？**
+
+```xml
+<!-- 格式化的 XML（有换行和缩进）-->
+<w:p>
+    <w:r>你好</w:r>
+</w:p>
+
+实际的 DOM 树：
+<w:p>
+  ├─ Text节点: "\n    "     ← firstChild 是这个！
+  ├─ Element: <w:r>         ← 不是这个
+  └─ Text节点: "\n"
+```
+
+**原因：minidom 把 XML 标签之间的所有字符（包括换行、空格、缩进）都当成文本节点！**
+
+```xml
+<w:p>↵····<w:r>  →  解析为: Text("\n    ") + Element(<w:r>)
+     ↑换行+空格↑
+```
+
+**解决方案：**
+
+```python
+# ❌ 错误：直接用 firstChild
+element.firstChild.toxml()  # 可能是空白文本！
+
+# ✅ 正确：检查节点类型
+for child in element.childNodes:
+    if child.nodeType == child.ELEMENT_NODE:  # 跳过文本节点
+        print(child.toxml())
+
+# ✅ 或者：直接用 getElementsByTagName
+first_r = element.getElementsByTagName('w:r')[0]
+```
+
+**这就是 extractor.py 第129行为什么要检查 `nodeType` 的原因！**
+
+---
+
+## 7️⃣ 核心流程图（extractor.py 做了什么）
 
 ```
 XML 文件

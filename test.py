@@ -24,17 +24,18 @@ xml_string = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 dom = minidom.parseString(xml_string)
+paras = dom.getElementsByTagName('w:p')
 runs = dom.getElementsByTagName('w:r')
-first_run = runs[0]
-t_element = first_run.getElementsByTagName('w:t')
-first_text_element_of_first_run = t_element[0]
-text1 = first_text_element_of_first_run.firstChild
+texts = dom.getElementsByTagName('w:t')
 
-print(type(runs), runs.toxml())
-print(type(first_run), first_run.toxml())
-print(type(t_element), t_element.toxml())
-print(type(first_text_element_of_first_run), first_text_element_of_first_run.toxml())
-print(type(text1), text1.toxml())
+para1 = paras[0]
+run1 = runs[0]
+text1= texts[0]
 
-print(f"text1 nodeType: {text1.nodeType}, nodeName: {text1.nodeName}, nodeValue: {text1.nodeValue}")
-print(f"Is text1 a TEXT_NODE? {text1.nodeType == text1.TEXT_NODE}")
+for text in texts:
+    print(type(text), type(text.firstChild), type(text.firstChild.nodeValue))
+    print(text)
+    print(text.firstChild)
+    print(text.firstChild.nodeValue)
+    print(text.toxml())
+    print(text.firstChild.toxml())
