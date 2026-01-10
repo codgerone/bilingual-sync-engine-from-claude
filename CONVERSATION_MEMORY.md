@@ -4,67 +4,90 @@
 
 ---
 
-## 📅 最近更新：2026-01-08
+## 📅 最近更新：2026-01-10
 
 ### 当前学习进度
 
-**阶段**：extractor.py 重构完成，准备继续 mapper.py
+**阶段**：mapper.py 重构完成（Prompt Caching 优化），继续深入学习
 
 **已完成**：
 - ✅ 理解 minidom 的基本概念
 - ✅ 理解 extractor.py 各函数的输入输出
 - ✅ 讨论并确定了 V2 重塑方案（语义驱动）
-- ✅ **清理 extractor.py** - 删除所有 V1 代码，只保留 V2
-- ✅ **重构 extractor.py** - 打包提取 + 快速检查优化
-- ✅ **添加文件结构图** - 在 extractor.py 开头添加结构和数据流图
+- ✅ 清理 extractor.py - 删除所有 V1 代码，只保留 V2
+- ✅ 重构 extractor.py - 打包提取 + 快速检查优化
+- ✅ **清理 mapper.py** - 删除 V1 代码
+- ✅ **生成 mapper.py 知识地图** - 详细介绍 API、Prompt 工程、JSON 解析
+- ✅ **实现 Prompt Caching 优化** - 节省约 60% API 成本
 
 **进行中**：
-- 🔄 学习 mapper.py
+- 🔄 继续深入学习 mapper.py 的其他细节
 
 ---
 
-### 🎯 extractor.py 重构要点（2026-01-08）
+### 🎯 mapper.py 重构要点（2026-01-10）
 
-**1. 打包提取（替代分立提取）**
+**1. 清理 V1 代码**
+- 删除 `map_revision()`, `map_revisions_batch()` 等旧方法
+- 只保留 V2 的 `map_text_revision()`, `map_row_pairs()`
 
-原来：
-```python
-source_texts = extract_text_versions_from_column(0)  # 源语言
-target_texts = extract_clean_text_from_column(1)     # 目标语言
-# 需要手动通过 row_index 匹配
+**2. Prompt Caching 优化**
+
+Meiqi 提出的问题：每行修订都发送完整 prompt，重复的部分（角色、原则、格式）是否浪费 token？
+
+**答案**：是的！输入 token 也消耗费用。
+
+**解决方案**：使用 Anthropic Prompt Caching
+
+```
+优化前：每行都发送 ~600 tokens
+调用1: [角色+原则+格式](450) + [数据](150)
+调用2: [角色+原则+格式](450) + [数据](150)  ← 重复！
+
+优化后：固定部分缓存
+调用1: [system prompt 创建缓存](450×1.25) + [数据](150)
+调用2: [读取缓存](450×0.1) + [数据](150)  ← 便宜 90%！
 ```
 
-现在：
+**新增方法**：
+- `_build_system_prompt()` - 构建可缓存的系统提示（含 3 个 few-shot 示例）
+- `_build_user_message()` - 构建每行变化的用户消息
+
+**关键代码**：
 ```python
-row_pairs = extract_row_pairs(source_column=0, target_column=1)
-# 返回: [{row_index, source_before, source_after, target_current}, ...]
-# 数据天然关联，直接喂给 LLM
+response = client.messages.create(
+    system=[{
+        "type": "text",
+        "text": "固定内容...",
+        "cache_control": {"type": "ephemeral"}  # 关键：标记缓存
+    }],
+    messages=[{"role": "user", "content": "变化内容..."}]
+)
 ```
 
-**2. 快速检查优化**
-- 新增 `_has_revisions()` 方法
-- 先检查单元格是否有 `w:del` 或 `w:ins`，无修订直接跳过
-- 只返回有修订的行，提升处理速度
+**3. 关键学习：Token 消耗机制**
 
-**3. 文件结构图**
-- 在文件开头添加了结构图和数据流图
-- 打开文件即可快速了解整体脉络
+| 类型 | 内容 | 消耗 |
+|------|------|------|
+| 输入 token | 你发送的 prompt | ✅ 消耗（较便宜） |
+| 输出 token | LLM 生成的回复 | ✅ 消耗（较贵，约 5 倍） |
 
 ---
 
-### 📁 extractor.py 当前结构
+### 📁 mapper.py 当前结构
 
 ```
-RevisionExtractor 类
-├── __init__(unpacked_dir)                  # 初始化，设置文档路径
-└── extract_row_pairs()                     # 主入口：打包提取有修订的行
-    ├── _has_revisions()                    # 快速检查单元格是否有修订
-    ├── _extract_text_versions_from_cell()  # 提取源语言修订前后文本
-    │   └── _extract_text_from_node()       # 从节点提取纯文本
-    └── _extract_all_text_from_cell()       # 提取目标语言纯净文本
-
-独立函数
-└── decode_html_entities()                  # HTML实体 → Unicode字符
+RevisionMapper 类
+├── __init__(api_key, model)           # 初始化客户端 + 缓存变量
+│
+├── map_row_pairs()                    # 主入口：处理 extractor 输出的行对
+├── map_text_revision()                # 单行映射：调用 LLM API（使用缓存）
+│
+├── _parse_text_response()             # 解析 JSON 响应
+│
+└── Prompt Caching 相关
+    ├── _build_system_prompt()         # 构建可缓存的系统提示（固定部分）
+    └── _build_user_message()          # 构建用户消息（变化部分）
 ```
 
 ---
@@ -80,7 +103,7 @@ RevisionExtractor 类
 
 ### ⏭️ 下次对话继续的内容
 
-1. 学习 mapper.py - 需要适配新的 extractor 数据结构
+1. 继续深入学习 mapper.py 的其他细节（如有问题）
 2. 学习 applier.py
 3. 学习 engine.py
 4. 用真实双语 Word 文档测试完整流程
@@ -88,6 +111,14 @@ RevisionExtractor 类
 ---
 
 ## 📜 历史记录归档
+
+### 2026-01-08：extractor.py 重构完成
+
+**完成的工作**：
+- 清理 extractor.py 中的 V1 代码
+- 实现打包提取（`extract_row_pairs()`）
+- 新增快速检查优化（`_has_revisions()`）
+- 添加文件结构图到 extractor.py 开头
 
 ### 2026-01-07：V2 重塑方案实现
 
@@ -129,6 +160,7 @@ RevisionExtractor 类
 | 文件名 | 用途 |
 |-------|------|
 | `minidom_knowledge_map.md` | minidom 一页纸知识地图 |
+| `mapper_knowledge_map.md` | mapper.py 知识地图（API、Prompt工程、JSON、Prompt Caching） |
 | `test.py` | 测试 minidom 基本用法 |
 | `test_of_minidom.py` | 详细的 minidom 演示代码 |
 | `test_nodelist.py` | 测试 NodeList 和 Element 的区别 |

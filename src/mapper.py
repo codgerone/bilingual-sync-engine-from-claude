@@ -1,15 +1,68 @@
 """
-LLM映射器 - 使用大语言模型将修订映射到目标语言
+================================================================================
+LLM 映射器 - 使用大语言模型将修订映射到目标语言
+================================================================================
 
-核心功能：
+模块定位
+--------
+这是三模块管道中唯一调用外部 API 的模块：
+
+    extractor.py ──→ mapper.py ──→ applier.py
+    (提取修订)       (LLM映射)      (应用修订)
+                        ↓
+                   Anthropic API
+
+核心职责
+--------
 1. 理解源语言修订前后的语义差异
 2. 在目标语言中做最小改动以反映相同的语义变化
 3. 返回目标语言的修订后完整文本
 
-V2 重塑说明：
-- 不再传递 deletion/insertion 碎片
-- 传递源语言的 before_text 和 after_text
-- 让 LLM 理解语义差异，而非词汇对应
+数据流
+------
+输入（来自 extractor）:
+    {
+        'source_before': '修订前的源语言文本',
+        'source_after': '修订后的源语言文本',
+        'target_current': '目标语言当前文本'
+    }
+
+输出（给 applier）:
+    {
+        'target_after': 'LLM 生成的目标语言修订后文本',
+        'explanation': 'LLM 的解释',
+        'confidence': 0.95
+    }
+
+设计原则
+--------
+- 语义驱动：翻译是语义对应，不是词汇对应
+- 最小改动：只改必须改的部分
+- 确定性输出：temperature=0.0 保证相同输入得到相同输出
+
+性能优化：Prompt Caching
+------------------------
+使用 Anthropic Prompt Caching 功能优化 API 调用效率：
+
+    优化前：每行都发送完整 prompt（~600 tokens）
+    ┌─────────────────────────────────────────────┐
+    │ [角色+背景+原则+格式] + [数据]  → API 调用 1 │
+    │ [角色+背景+原则+格式] + [数据]  → API 调用 2 │
+    │ ...重复发送相同的固定内容...                │
+    └─────────────────────────────────────────────┘
+
+    优化后：固定部分缓存，只发送变化数据
+    ┌─────────────────────────────────────────────┐
+    │ [system prompt 创建缓存] + [数据] → 调用 1  │
+    │ [读取缓存(0.1x成本)] + [数据]     → 调用 2  │
+    │ ...后续调用节省约 60% 成本...               │
+    └─────────────────────────────────────────────┘
+
+关键实现：
+- system 参数：固定内容（角色、原则、示例），带 cache_control 标记
+- messages 参数：变化内容（每行的 before/after/current）
+- 缓存有效期：5 分钟（Anthropic 默认）
+================================================================================
 """
 
 import anthropic
@@ -18,20 +71,40 @@ import json
 
 
 class RevisionMapper:
-    """使用LLM将修订从源语言映射到目标语言"""
+    """
+    使用 LLM 将修订从源语言映射到目标语言
+
+    结构图
+    ------
+    RevisionMapper
+    ├── __init__(api_key, model)           # 初始化客户端 + 缓存变量
+    │
+    ├── map_row_pairs()                    # 主入口：处理 extractor 输出的行对
+    ├── map_text_revision()                # 单行映射：调用 LLM API（使用缓存）
+    │
+    ├── _parse_text_response()             # 解析 JSON 响应
+    │
+    └── Prompt Caching 相关
+        ├── _build_system_prompt()         # 构建可缓存的系统提示（固定部分）
+        └── _build_user_message()          # 构建用户消息（变化部分）
+    """
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
         """
         初始化映射器
 
         Args:
-            api_key: Anthropic API密钥
-            model: 使用的模型
+            api_key: Anthropic API 密钥（从环境变量 ANTHROPIC_API_KEY 获取）
+            model: 使用的模型，默认 claude-sonnet-4-20250514
         """
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-    # ========== V2 新方法 ==========
+        # Prompt Caching：缓存当前文档的 system prompt
+        # 同一文档内 source_lang/target_lang 固定，可以复用
+        self._cached_system_prompt = None
+        self._cached_source_lang = None
+        self._cached_target_lang = None
 
     def map_text_revision(
         self,
@@ -42,7 +115,7 @@ class RevisionMapper:
         target_lang: str = "英文"
     ) -> Dict:
         """
-        将源语言的文本修订映射到目标语言（V2 新方法）
+        将源语言的文本修订映射到目标语言（使用 Prompt Caching）
 
         Args:
             source_before: 源语言修订前的完整文本
@@ -57,126 +130,84 @@ class RevisionMapper:
                 'explanation': LLM 的解释,
                 'confidence': 置信度 (0-1)
             }
+
+        优化说明:
+            - system 参数包含固定内容，带 cache_control 标记
+            - messages 参数只包含每行变化的数据
+            - 首次调用创建缓存，后续调用读取缓存，节省约 60% 成本
         """
-        prompt = self._build_text_mapping_prompt(
+        # 检查是否需要更新缓存的 system prompt
+        # 当语言对变化时，需要重新构建
+        if (self._cached_system_prompt is None or
+            self._cached_source_lang != source_lang or
+            self._cached_target_lang != target_lang):
+            self._cached_system_prompt = self._build_system_prompt(source_lang, target_lang)
+            self._cached_source_lang = source_lang
+            self._cached_target_lang = target_lang
+
+        # 构建变化的用户消息
+        user_message = self._build_user_message(
             source_before, source_after, target_current, source_lang, target_lang
         )
 
+        # 使用 Prompt Caching 调用 API
         response = self.client.messages.create(
             model=self.model,
             max_tokens=2000,
             temperature=0.0,  # 确定性输出
-            messages=[{"role": "user", "content": prompt}]
+            system=self._cached_system_prompt,  # 固定部分，带缓存标记
+            messages=[{"role": "user", "content": user_message}]  # 变化部分
         )
 
         result = self._parse_text_response(response.content[0].text)
         return result
 
-    def map_text_revisions_batch(
+    def map_row_pairs(
         self,
-        source_items: List[Dict],
-        target_items: List[Dict],
+        row_pairs: List[Dict],
         source_lang: str = "中文",
         target_lang: str = "英文"
     ) -> List[Dict]:
         """
-        批量映射多行文本修订（V2 新方法）
+        主入口：处理 extractor 输出的行对列表
 
         Args:
-            source_items: 源语言列表，每项含 {row_index, before_text, after_text, has_revisions}
-            target_items: 目标语言列表，每项含 {row_index, current_text}
+            row_pairs: extractor.extract_row_pairs() 的输出
+                       每项含 {row_index, source_before, source_after, target_current}
             source_lang: 源语言名称
             target_lang: 目标语言名称
 
         Returns:
-            映射结果列表
+            映射结果列表，每项含：
+            {
+                'row_index': 行号,
+                'target_current': 目标语言当前文本,
+                'target_after': 目标语言修订后文本,
+                'explanation': LLM 的解释,
+                'confidence': 置信度
+            }
         """
         results = []
 
-        # 按 row_index 配对
-        target_by_row = {item['row_index']: item for item in target_items}
-
-        for source in source_items:
-            if not source.get('has_revisions', False):
-                # 没有修订的行跳过
-                continue
-
-            row_idx = source['row_index']
-            target = target_by_row.get(row_idx)
-
-            if not target:
-                print(f"警告: 行 {row_idx} 在目标语言列中未找到对应文本")
-                continue
+        for pair in row_pairs:
+            row_idx = pair['row_index']
 
             mapped = self.map_text_revision(
-                source_before=source['before_text'],
-                source_after=source['after_text'],
-                target_current=target['current_text'],
+                source_before=pair['source_before'],
+                source_after=pair['source_after'],
+                target_current=pair['target_current'],
                 source_lang=source_lang,
                 target_lang=target_lang
             )
 
             mapped['row_index'] = row_idx
-            mapped['target_current'] = target['current_text']
+            mapped['target_current'] = pair['target_current']
             results.append(mapped)
 
         return results
 
-    def _build_text_mapping_prompt(
-        self,
-        source_before: str,
-        source_after: str,
-        target_current: str,
-        source_lang: str,
-        target_lang: str
-    ) -> str:
-        """构建 V2 新 prompt"""
-
-        prompt = f"""你是一个专业的双语法律文档翻译专家。
-
-## 任务背景
-
-一份双语文档中，{source_lang}版本进行了修订。现在需要将这个修订同步到{target_lang}版本。
-
-## {source_lang}的变化
-
-**修订前：**
-{source_before}
-
-**修订后：**
-{source_after}
-
-## {target_lang}当前文本
-
-{target_current}
-
-## 你的任务
-
-1. 首先理解{source_lang}从"修订前"到"修订后"发生了什么**语义变化**
-2. 然后在{target_lang}当前文本的基础上，做**最小的改动**来反映相同的语义变化
-3. 返回{target_lang}修订后的**完整文本**
-
-## 重要原则
-
-- **语义对应**：翻译是语义对应，不是词汇对应。例如中文删除"正在"，英文可能需要改变时态而非删除某个词
-- **最小改动**：只改必须改的部分，保持其他内容不变
-- **语法正确**：确保修订后的{target_lang}文本语法正确、表达自然
-
-## 输出格式
-
-请以 JSON 格式返回：
-```json
-{{
-  "target_after": "修订后的{target_lang}完整文本",
-  "explanation": "简要说明你理解的语义变化，以及你在{target_lang}中做了什么改动",
-  "confidence": 0.95
-}}
-```
-"""
-        return prompt
-
     def _parse_text_response(self, response_text: str) -> Dict:
-        """解析 V2 响应"""
+        """解析 LLM 的 JSON 响应"""
         try:
             # 提取 JSON 代码块
             if "```json" in response_text:
@@ -215,180 +246,150 @@ class RevisionMapper:
                 'error': str(e)
             }
 
-    # ========== V1 旧方法（保留以便对比） ==========
-
-    def map_revision(
-        self,
-        source_revision: Dict,
-        target_text: str,
-        source_lang: str = "中文",
-        target_lang: str = "英文"
-    ) -> Dict:
+    def _build_system_prompt(self, source_lang: str, target_lang: str) -> list:
         """
-        将单个修订映射到目标语言（V1 旧方法）
+        构建可缓存的系统提示（固定部分）
+
+        使用 Anthropic Prompt Caching 功能：
+        - 将不变的内容（角色、背景、原则、格式、示例）放入 system prompt
+        - 添加 cache_control 标记，让 API 缓存这部分内容
+        - 后续调用只需发送变化的数据，节省约 60% 成本
 
         Args:
-            source_revision: 源语言的修订信息
-            target_text: 目标语言的完整文本
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
+            source_lang: 源语言名称（如"中文"）
+            target_lang: 目标语言名称（如"英文"）
 
         Returns:
-            包含目标语言修订的字典：
-            {
-                'deletion': 要删除的目标语言文本,
-                'insertion': 要插入的目标语言文本,
-                'confidence': 置信度 (0-1)
-            }
+            符合 Anthropic API system 参数格式的列表
         """
-        prompt = self._build_mapping_prompt(
-            source_revision, target_text, source_lang, target_lang
-        )
+        system_text = f"""你是一个专业的双语法律文档翻译专家。
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
+## 任务背景
 
-        # 解析响应
-        result = self._parse_response(response.content[0].text)
+一份双语文档中，{source_lang}版本进行了修订。你需要将这些修订同步到{target_lang}版本。
 
-        return result
+## 你的任务
 
-    def map_revisions_batch(
-        self,
-        source_revisions: List[Dict],
-        target_texts: List[str],
-        source_lang: str = "中文",
-        target_lang: str = "英文"
-    ) -> List[Dict]:
-        """
-        批量映射多个修订（V1 旧方法）
+1. 理解{source_lang}从"修订前"到"修订后"发生了什么**语义变化**
+2. 在{target_lang}当前文本的基础上，做**最小的改动**来反映相同的语义变化
+3. 返回{target_lang}修订后的**完整文本**
 
-        Args:
-            source_revisions: 源语言修订列表
-            target_texts: 对应的目标语言文本列表
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
+## 重要原则
 
-        Returns:
-            目标语言修订列表
-        """
-        results = []
+- **语义对应**：翻译是语义对应，不是词汇对应。例如中文删除"正在"，英文可能需要改变时态而非删除某个词
+- **最小改动**：只改必须改的部分，保持其他内容不变
+- **语法正确**：确保修订后的{target_lang}文本语法正确、表达自然
 
-        for revision, target_text in zip(source_revisions, target_texts):
-            mapped = self.map_revision(
-                revision, target_text, source_lang, target_lang
-            )
-            results.append(mapped)
+## 输出格式
 
-        return results
-
-    def _build_mapping_prompt(
-        self,
-        source_revision: Dict,
-        target_text: str,
-        source_lang: str,
-        target_lang: str
-    ) -> str:
-        """构建发送给LLM的提示（V1 旧方法）"""
-
-        prompt = f"""你是一个专业的双语法律文档翻译专家。现在需要将{source_lang}文档中的一个track change（修订）同步应用到对应的{target_lang}翻译文本中。
-
-**{source_lang}的修订信息：**
-- 删除的文本: "{source_revision['deletion']}"
-- 插入的文本: "{source_revision['insertion']}"
-- 修订前的上下文: "{source_revision['context_before']}"
-- 修订后的上下文: "{source_revision['context_after']}"
-
-**{target_lang}的当前完整文本：**
-"{target_text}"
-
-**任务：**
-请在{target_lang}文本中找到对应的部分，并提供应该进行的修订。
-
-**要求：**
-1. 保持翻译的准确性和专业性
-2. 修订应该与{source_lang}的修订在语义上完全对应
-3. 只标记实际改变的部分，不要包含不变的文本
-4. 确保修订后的文本仍然符合{target_lang}的语法和表达习惯
-
-**请以JSON格式返回结果：**
+请以 JSON 格式返回：
 ```json
 {{
-  "deletion": "要删除的{target_lang}文本",
-  "insertion": "要插入的{target_lang}文本",
-  "explanation": "简要说明这个映射的理由",
+  "target_after": "修订后的{target_lang}完整文本",
+  "explanation": "简要说明你理解的语义变化，以及你在{target_lang}中做了什么改动",
   "confidence": 0.95
 }}
 ```
 
-注意：
-- deletion是{target_lang}中要删除的部分
-- insertion是{target_lang}中要插入的新文本
-- confidence是你对这个映射的置信度（0-1之间）
-"""
+## 参考示例
 
-        return prompt
+### 示例 1：时态变化
+- {source_lang}修订前："AI正在改变我们的生活"
+- {source_lang}修订后："AI改变了我们的生活"
+- {target_lang}当前："AI is changing our life"
+- {target_lang}修订后："AI has changed our life"
+- 解释：从进行时变为完成时，英文相应调整时态
 
-    def _parse_response(self, response_text: str) -> Dict:
-        """解析LLM的响应"""
-        try:
-            # 提取JSON代码块
-            if "```json" in response_text:
-                start = response_text.find("```json") + 7
-                end = response_text.find("```", start)
-                json_str = response_text[start:end].strip()
-            else:
-                json_str = response_text.strip()
-            
-            result = json.loads(json_str)
-            
-            # 验证必要字段
-            if 'deletion' not in result or 'insertion' not in result:
-                raise ValueError("响应缺少必要字段")
-            
-            # 设置默认置信度
-            if 'confidence' not in result:
-                result['confidence'] = 0.8
-            
-            return result
-            
-        except Exception as e:
-            print(f"解析响应失败: {e}")
-            print(f"原始响应: {response_text}")
-            
-            # 返回一个默认值
-            return {
-                'deletion': '',
-                'insertion': '',
-                'confidence': 0.0,
-                'error': str(e)
+### 示例 2：数量修改
+- {source_lang}修订前："协议有效期为一年"
+- {source_lang}修订后："协议有效期为两年"
+- {target_lang}当前："The agreement is valid for one year"
+- {target_lang}修订后："The agreement is valid for two years"
+- 解释：只修改数量词，保持其他部分不变
+
+### 示例 3：法律用语调整
+- {source_lang}修订前："甲方应当支付"
+- {source_lang}修订后："甲方须支付"
+- {target_lang}当前："Party A should pay"
+- {target_lang}修订后："Party A shall pay"
+- 解释：语气从"应当"变为"须"，英文用 shall 表达强制性"""
+
+        return [
+            {
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"}  # 标记为可缓存
             }
+        ]
 
+    def _build_user_message(
+        self,
+        source_before: str,
+        source_after: str,
+        target_current: str,
+        source_lang: str,
+        target_lang: str
+    ) -> str:
+        """
+        构建每行变化的用户消息（不缓存）
 
+        只包含每行修订的具体数据，配合缓存的 system prompt 使用。
+
+        Args:
+            source_before: 源语言修订前的文本
+            source_after: 源语言修订后的文本
+            target_current: 目标语言当前文本
+            source_lang: 源语言名称
+            target_lang: 目标语言名称
+
+        Returns:
+            用户消息字符串
+        """
+        return f"""## {source_lang}的变化
+
+**修订前：**
+{source_before}
+
+**修订后：**
+{source_after}
+
+## {target_lang}当前文本
+
+{target_current}
+
+请分析语义变化并返回{target_lang}修订后的完整文本。"""
+
+# ============================================================
 # 使用示例
+# ============================================================
+
 if __name__ == "__main__":
     import os
 
-    # 从环境变量获取API密钥
+    # 从环境变量获取 API 密钥
     api_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not api_key:
-        print("请设置ANTHROPIC_API_KEY环境变量")
+        print("请设置 ANTHROPIC_API_KEY 环境变量")
+        print("Windows: set ANTHROPIC_API_KEY=your-key-here")
+        print("Linux/Mac: export ANTHROPIC_API_KEY='your-key-here'")
         exit(1)
 
     mapper = RevisionMapper(api_key)
 
-    print("=" * 50)
-    print("V2 新方法：基于语义差异的映射")
-    print("=" * 50)
+    # ========== 示例 1：单行映射 ==========
+    print("=" * 60)
+    print("示例 1：单行映射 (map_text_revision)")
+    print("=" * 60)
 
-    # V2 示例：传递完整的修订前后文本
     source_before = "AI正在改变我们的生活。"
     source_after = "AI改变了我们的生活。"
     target_current = "AI is changing our life."
+
+    print(f"\n输入:")
+    print(f"  源语言修订前: {source_before}")
+    print(f"  源语言修订后: {source_after}")
+    print(f"  目标语言当前: {target_current}")
 
     result = mapper.map_text_revision(
         source_before=source_before,
@@ -398,38 +399,39 @@ if __name__ == "__main__":
         target_lang="英文"
     )
 
-    print(f"\n源语言修订前: {source_before}")
-    print(f"源语言修订后: {source_after}")
-    print(f"目标语言当前: {target_current}")
-    print(f"\n映射结果:")
+    print(f"\n输出:")
     print(f"  目标语言修订后: {result['target_after']}")
     print(f"  置信度: {result['confidence']}")
     print(f"  说明: {result.get('explanation', '')}")
 
-    print("\n" + "=" * 50)
-    print("V1 旧方法（保留以便对比）")
-    print("=" * 50)
+    # ========== 示例 2：批量映射（模拟 extractor 输出）==========
+    print("\n" + "=" * 60)
+    print("示例 2：批量映射 (map_row_pairs)")
+    print("=" * 60)
 
-    # V1 示例：传递 deletion/insertion 碎片
-    source_revision = {
-        'deletion': '天气',
-        'insertion': '空气质量',
-        'context_before': '你好！今天',
-        'context_after': '怎么样？'
-    }
+    # 模拟 extractor.extract_row_pairs() 的输出
+    row_pairs = [
+        {
+            'row_index': 0,
+            'source_before': '本协议由甲方和乙方签订。',
+            'source_after': '本协议由甲方与乙方签订。',
+            'target_current': 'This agreement is signed by Party A and Party B.'
+        },
+        {
+            'row_index': 1,
+            'source_before': '协议有效期为一年。',
+            'source_after': '协议有效期为两年。',
+            'target_current': 'The agreement is valid for one year.'
+        }
+    ]
 
-    target_text = "Hello! How's the weather today?"
+    print(f"\n输入: {len(row_pairs)} 行修订")
 
-    result = mapper.map_revision(
-        source_revision,
-        target_text,
-        source_lang="中文",
-        target_lang="英文"
-    )
+    results = mapper.map_row_pairs(row_pairs, source_lang="中文", target_lang="英文")
 
-    print("映射结果:")
-    print(f"  删除: {result['deletion']}")
-    print(f"  插入: {result['insertion']}")
-    print(f"  置信度: {result['confidence']}")
-    if 'explanation' in result:
-        print(f"  说明: {result['explanation']}")
+    print(f"\n输出:")
+    for r in results:
+        print(f"\n  行 {r['row_index']}:")
+        print(f"    当前: {r['target_current']}")
+        print(f"    修订后: {r['target_after']}")
+        print(f"    置信度: {r['confidence']}")
