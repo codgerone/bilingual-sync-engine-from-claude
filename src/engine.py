@@ -1,47 +1,83 @@
 """
-双语同步引擎主模块
+================================================================================
+Bilingual Sync Engine - Main Orchestration Module
+================================================================================
 
-整合提取、映射、应用三个核心功能
+Architecture
+------------
+                       ┌─────────────────┐
+                       │BilingualSyncEngine│
+                       └────────┬────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┐
+        │                       │                       │
+        v                       v                       v
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Extractor   │ ───> │   Mapper     │ ───> │   Applier    │
+│(extract rows)│      │(LLM mapping) │      │(apply diffs) │
+└──────────────┘      └──────────────┘      └──────────────┘
+        │                       │                       │
+        v                       v                       v
+   row_pairs              mapped_results          document.xml
 
-V2 重塑说明：
-- sync_v2() 使用新的语义驱动方案
-- extractor 输出 before_text/after_text
-- mapper 让 LLM 理解语义差异
-- applier 使用词级别 diff
+Data Flow
+---------
+1. Unpack .docx (ZIP) -> XML files
+2. Extract revisions from source column
+3. Map revisions via LLM (max_tokens or batch strategy)
+4. Apply changes to target column using word-level diff
+5. Pack XML files -> .docx
+
+================================================================================
 """
 
 import os
 import subprocess
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional
+
 from .extractor import RevisionExtractor, decode_html_entities
 from .mapper import RevisionMapper
-from .applier import SmartRevisionApplier, DiffBasedApplier
+from .applier import DiffBasedApplier
+from .config import Config
 
 
 class BilingualSyncEngine:
-    """双语Word文档Track Changes同步引擎"""
-    
+    """
+    Bilingual Word Document Track Changes Sync Engine.
+
+    Orchestrates the three-module pipeline:
+    1. Extractor: Parse OOXML, extract revisions
+    2. Mapper: Use LLM to map revisions to target language
+    3. Applier: Generate track changes in target column
+    """
+
     def __init__(
         self,
         docx_path: str,
+        provider: str = None,
         api_key: str = None,
+        model: str = None,
+        strategy: str = None,
         source_column: int = 0,
         target_column: int = 1,
-        source_lang: str = "中文",
-        target_lang: str = "英文",
+        source_lang: str = "Chinese",
+        target_lang: str = "English",
         author: str = "Claude"
     ):
         """
-        初始化同步引擎
-        
+        Initialize the sync engine.
+
         Args:
-            docx_path: Word文档路径
-            api_key: Anthropic API密钥
-            source_column: 源语言列索引（0=左，1=右）
-            target_column: 目标语言列索引
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
-            author: 修订作者名称
+            docx_path: Path to Word document
+            provider: LLM provider (anthropic, deepseek, qwen, etc.)
+            api_key: API key (or use environment variable)
+            model: Model name (or use provider default)
+            strategy: "max_tokens" or "batch" (max_tokens = 每次调用顶格输出)
+            source_column: Source language column index (0 = left)
+            target_column: Target language column index (1 = right)
+            source_lang: Source language name
+            target_lang: Target language name
+            author: Author name for track changes
         """
         self.docx_path = docx_path
         self.source_column = source_column
@@ -49,297 +85,164 @@ class BilingualSyncEngine:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.author = author
-        
-        # 设置工作目录
+
+        # Set up working directory
         self.work_dir = os.path.splitext(docx_path)[0] + "_work"
         self.unpacked_dir = os.path.join(self.work_dir, "unpacked")
-        
-        # 初始化API密钥
+
+        # Use defaults from config if not specified
+        self.provider = provider or Config.DEFAULT_PROVIDER
+        self.strategy = strategy or Config.DEFAULT_STRATEGY
+
+        # Get API key from environment if not provided
         if api_key is None:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-        
+            api_key = Config.get_api_key(self.provider)
+
         if not api_key:
-            raise ValueError("需要提供API密钥或设置ANTHROPIC_API_KEY环境变量")
-        
-        # 初始化各个组件
-        self.extractor = None
-        self.mapper = RevisionMapper(api_key)
-        self.applier = None
-    
+            raise ValueError(
+                f"API key required for {self.provider}. "
+                f"Set environment variable or pass api_key parameter."
+            )
+
+        # Initialize mapper with the new unified interface
+        self.mapper = RevisionMapper(
+            provider=self.provider,
+            api_key=api_key,
+            model=model,
+            strategy=self.strategy
+        )
+
+        # These will be initialized after unpacking
+        self.extractor: Optional[RevisionExtractor] = None
+        self.applier: Optional[DiffBasedApplier] = None
+
     def sync(self, output_path: str = None) -> str:
         """
-        执行完整的同步流程
-        
-        Args:
-            output_path: 输出文档路径，如果为None则自动生成
-            
-        Returns:
-            输出文档的路径
-        """
-        print("=" * 60)
-        print("双语Word文档Track Changes同步引擎")
-        print("=" * 60)
-        
-        # 1. 解包文档
-        print("\n[1/6] 解包Word文档...")
-        self._unpack_document()
-        
-        # 2. 初始化组件
-        print("[2/6] 初始化组件...")
-        self.extractor = RevisionExtractor(self.unpacked_dir)
-        self.applier = SmartRevisionApplier(self.unpacked_dir, author=self.author)
-        
-        # 3. 提取源语言修订
-        print(f"[3/6] 从{self.source_lang}列提取修订...")
-        source_revisions = self.extractor.extract_revisions_from_column(
-            self.source_column
-        )
-        
-        print(f"  找到 {len(source_revisions)} 个修订")
-        
-        if not source_revisions:
-            print("  没有发现修订，退出")
-            return None
-        
-        # 4. 提取目标语言文本
-        print(f"[4/6] 提取{self.target_lang}文本...")
-        target_texts = self._extract_target_texts()
-        
-        # 5. 使用LLM映射修订
-        print(f"[5/6] 使用LLM映射修订到{self.target_lang}...")
-        mapped_revisions = []
-        
-        for i, source_rev in enumerate(source_revisions):
-            row_idx = source_rev['row_index']
-            target_text = target_texts[row_idx] if row_idx < len(target_texts) else ""
-            
-            print(f"\n  映射修订 {i+1}/{len(source_revisions)}:")
-            print(f"    {self.source_lang}: {decode_html_entities(source_rev['deletion'])} → {decode_html_entities(source_rev['insertion'])}")
-            
-            mapped = self.mapper.map_revision(
-                source_rev,
-                target_text,
-                self.source_lang,
-                self.target_lang
-            )
-            
-            print(f"    {self.target_lang}: {mapped['deletion']} → {mapped['insertion']}")
-            print(f"    置信度: {mapped.get('confidence', 'N/A')}")
-            
-            mapped_revisions.append({
-                'row_index': row_idx,
-                'revision': mapped
-            })
-        
-        # 6. 应用修订到目标语言列
-        print(f"\n[6/6] 应用修订到{self.target_lang}列...")
-        
-        success_count = 0
-        for item in mapped_revisions:
-            if self.applier.apply_revision_to_row(
-                row_index=item['row_index'],
-                column_index=self.target_column,
-                revision=item['revision']
-            ):
-                success_count += 1
-        
-        print(f"\n成功应用 {success_count}/{len(mapped_revisions)} 个修订")
-        
-        # 7. 保存文档
-        print("\n保存修改...")
-        self.applier.save()
-        
-        # 8. 打包文档
-        if output_path is None:
-            base, ext = os.path.splitext(self.docx_path)
-            output_path = f"{base}_synced{ext}"
-        
-        print(f"打包文档到: {output_path}")
-        self._pack_document(output_path)
-        
-        # 9. 验证
-        print("\n验证结果...")
-        self._verify_output(output_path)
-        
-        print("\n" + "=" * 60)
-        print("同步完成！")
-        print(f"输出文件: {output_path}")
-        print("=" * 60)
-
-        return output_path
-
-    # ========== V2 新方法：语义驱动的同步 ==========
-
-    def sync_v2(self, output_path: str = None) -> str:
-        """
-        执行 V2 版本的同步流程（语义驱动）
-
-        与 V1 的区别：
-        - 提取 before_text/after_text 而非 deletion/insertion
-        - LLM 理解语义差异，返回完整的 target_after
-        - 使用词级别 diff 生成 track changes
+        Execute the full sync pipeline.
 
         Args:
-            output_path: 输出文档路径，如果为None则自动生成
+            output_path: Output document path (auto-generated if None)
 
         Returns:
-            输出文档的路径
+            Path to output document
         """
         print("=" * 60)
-        print("双语Word文档Track Changes同步引擎 (V2 语义驱动)")
+        print("Bilingual Word Document Track Changes Sync Engine")
+        print(f"Provider: {self.provider} | Strategy: {self.strategy}")
         print("=" * 60)
 
-        # 1. 解包文档
-        print("\n[1/7] 解包Word文档...")
+        # Step 1: Unpack document
+        print("\n[1/6] Unpacking Word document...")
         self._unpack_document()
 
-        # 2. 初始化组件
-        print("[2/7] 初始化组件...")
+        # Step 2: Initialize components
+        print("[2/6] Initializing components...")
         self.extractor = RevisionExtractor(self.unpacked_dir)
         self.applier = DiffBasedApplier(self.unpacked_dir, author=self.author)
 
-        # 3. 从源语言列提取修订前后文本
-        print(f"[3/7] 从{self.source_lang}列提取修订前后文本...")
-        source_texts = self.extractor.extract_text_versions_from_column(
-            self.source_column
+        # Step 3: Extract row pairs
+        print(f"[3/6] Extracting revisions from {self.source_lang} column...")
+        row_pairs = self.extractor.extract_row_pairs(
+            source_column=self.source_column,
+            target_column=self.target_column
         )
 
-        # 过滤出有修订的行
-        revised_rows = [item for item in source_texts if item['has_revisions']]
-        print(f"  找到 {len(revised_rows)} 行有修订")
+        print(f"  Found {len(row_pairs)} rows with revisions")
 
-        if not revised_rows:
-            print("  没有发现修订，退出")
+        if not row_pairs:
+            print("  No revisions found, exiting")
             return None
 
-        # 4. 从目标语言列提取纯净文本
-        print(f"[4/7] 从{self.target_lang}列提取文本...")
-        target_texts = self.extractor.extract_clean_text_from_column(
-            self.target_column
-        )
+        # Step 4: Map revisions via LLM
+        print(f"[4/6] Mapping revisions to {self.target_lang} via LLM...")
 
-        # 5. 使用 LLM 映射修订
-        print(f"[5/7] 使用 LLM 映射修订到{self.target_lang}...")
-
-        mapped_results = self.mapper.map_text_revisions_batch(
-            source_items=revised_rows,
-            target_items=target_texts,
+        mapped_results = self.mapper.map_row_pairs(
+            row_pairs,
             source_lang=self.source_lang,
             target_lang=self.target_lang
         )
 
-        # 显示映射结果
+        # Display mapping results
         for result in mapped_results:
-            row_idx = result.get('row_index')
-            print(f"\n  行 {row_idx}:")
-            print(f"    当前: {result.get('target_current', '')[:50]}...")
-            print(f"    修订后: {result.get('target_after', '')[:50]}...")
-            print(f"    置信度: {result.get('confidence', 'N/A')}")
+            row_idx = result.get("row_index")
+            current = result.get("target_current", "")[:50]
+            after = result.get("target_after", "")[:50]
+            confidence = result.get("confidence", "N/A")
 
-        # 6. 应用修订到目标语言列
-        print(f"\n[6/7] 应用修订到{self.target_lang}列...")
+            print(f"\n  Row {row_idx}:")
+            print(f"    Current: {current}...")
+            print(f"    After: {after}...")
+            print(f"    Confidence: {confidence}")
+
+        # Step 5: Apply revisions
+        print(f"\n[5/6] Applying revisions to {self.target_lang} column...")
 
         success_count = self.applier.apply_mapped_revisions(
             mapped_results=mapped_results,
             column_index=self.target_column
         )
 
-        print(f"\n成功应用 {success_count}/{len(mapped_results)} 行修订")
+        print(f"\n  Successfully applied {success_count}/{len(mapped_results)} revisions")
 
-        # 7. 保存文档
-        print("\n保存修改...")
+        # Step 6: Save and pack
+        print("\n[6/6] Saving changes...")
         self.applier.save()
 
-        # 8. 打包文档
         if output_path is None:
             base, ext = os.path.splitext(self.docx_path)
-            output_path = f"{base}_synced_v2{ext}"
+            output_path = f"{base}_synced{ext}"
 
-        print(f"打包文档到: {output_path}")
+        print(f"  Packing document to: {output_path}")
         self._pack_document(output_path)
 
-        # 9. 验证
-        print("\n[7/7] 验证结果...")
-        self._verify_output(output_path)
+        # Verify if enabled
+        if Config.ENABLE_VERIFICATION:
+            print("\n  Verifying output...")
+            self._verify_output(output_path)
 
         print("\n" + "=" * 60)
-        print("V2 同步完成！")
-        print(f"输出文件: {output_path}")
+        print("Sync complete!")
+        print(f"Output: {output_path}")
         print("=" * 60)
 
         return output_path
 
-    # ========== V1 旧方法保留在上面 ==========
-
     def _unpack_document(self):
-        """解包Word文档"""
+        """Unpack Word document to XML files."""
         os.makedirs(self.work_dir, exist_ok=True)
-        
+
         cmd = [
             "python3",
-            "/mnt/skills/public/docx/ooxml/scripts/unpack.py",
+            Config.UNPACK_SCRIPT,
             self.docx_path,
             self.unpacked_dir
         ]
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
-            raise RuntimeError(f"解包失败: {result.stderr}")
-        
-        print(f"  文档已解包到: {self.unpacked_dir}")
-    
-    def _extract_target_texts(self) -> List[str]:
-        """提取目标语言列的所有文本"""
-        from defusedxml import minidom
-        
-        doc_xml_path = f"{self.unpacked_dir}/word/document.xml"
-        
-        with open(doc_xml_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        dom = minidom.parseString(content)
-        rows = dom.getElementsByTagName('w:tr')
-        
-        texts = []
-        
-        for row in rows:
-            cells = row.getElementsByTagName('w:tc')
-            if self.target_column < len(cells):
-                cell = cells[self.target_column]
-                
-                # 提取所有文本节点
-                text_parts = []
-                for t_node in cell.getElementsByTagName('w:t'):
-                    if t_node.firstChild:
-                        text_parts.append(t_node.firstChild.nodeValue)
-                
-                text = ''.join(text_parts)
-                texts.append(decode_html_entities(text))
-            else:
-                texts.append("")
-        
-        return texts
-    
+            raise RuntimeError(f"Unpack failed: {result.stderr}")
+
+        print(f"  Unpacked to: {self.unpacked_dir}")
+
     def _pack_document(self, output_path: str):
-        """打包Word文档"""
+        """Pack XML files back to Word document."""
         cmd = [
             "python3",
-            "/mnt/skills/public/docx/ooxml/scripts/pack.py",
+            Config.PACK_SCRIPT,
             self.unpacked_dir,
             output_path
         ]
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
-            raise RuntimeError(f"打包失败: {result.stderr}")
-    
+            raise RuntimeError(f"Pack failed: {result.stderr}")
+
     def _verify_output(self, output_path: str):
-        """验证输出文档"""
-        # 使用pandoc转换为markdown以验证
-        md_path = output_path.replace('.docx', '_verify.md')
-        
+        """Verify output document using pandoc."""
+        md_path = output_path.replace(".docx", "_verify.md")
+
         cmd = [
             "pandoc",
             "--track-changes=all",
@@ -347,81 +250,117 @@ class BilingualSyncEngine:
             "-o",
             md_path
         ]
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode == 0:
-            print(f"  验证文件已生成: {md_path}")
-            
-            # 显示前几行
-            with open(md_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()[:10]
-            
-            print("\n  预览前10行:")
-            for line in lines:
-                print(f"    {line.rstrip()}")
+            print(f"    Verification file: {md_path}")
+
+            # Show preview
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()[:10]
+
+                print("\n    Preview (first 10 lines):")
+                for line in lines:
+                    print(f"      {line.rstrip()}")
+            except Exception:
+                pass
         else:
-            print(f"  验证失败: {result.stderr}")
+            print(f"    Verification failed: {result.stderr}")
 
 
-# 命令行接口
+# ================================================================================
+# Command Line Interface
+# ================================================================================
+
 def main():
+    """CLI entry point."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="双语Word文档Track Changes同步引擎"
+        description="Bilingual Word Document Track Changes Sync Engine"
     )
+
     parser.add_argument(
         "input",
-        help="输入的双语Word文档路径"
+        help="Input bilingual Word document path"
     )
     parser.add_argument(
         "-o", "--output",
-        help="输出文档路径（可选）"
+        help="Output document path (optional)"
+    )
+    parser.add_argument(
+        "--provider",
+        default="anthropic",
+        choices=["anthropic", "deepseek", "qwen", "wenxin", "doubao", "zhipu", "openai"],
+        help="LLM provider (default: anthropic)"
+    )
+    parser.add_argument(
+        "--strategy",
+        default="max_tokens",
+        choices=["max_tokens", "batch"],
+        help="Mapping strategy: max_tokens (顶格输出) or batch (预估批次) (default: max_tokens)"
+    )
+    parser.add_argument(
+        "--model",
+        help="Model name (uses provider default if not specified)"
+    )
+    parser.add_argument(
+        "--api-key",
+        help="API key (or use environment variable)"
     )
     parser.add_argument(
         "--source-column",
         type=int,
         default=0,
-        help="源语言列索引（默认: 0）"
+        help="Source language column index (default: 0)"
     )
     parser.add_argument(
         "--target-column",
         type=int,
         default=1,
-        help="目标语言列索引（默认: 1）"
+        help="Target language column index (default: 1)"
     )
     parser.add_argument(
         "--source-lang",
-        default="中文",
-        help="源语言名称（默认: 中文）"
+        default="Chinese",
+        help="Source language name (default: Chinese)"
     )
     parser.add_argument(
         "--target-lang",
-        default="英文",
-        help="目标语言名称（默认: 英文）"
+        default="English",
+        help="Target language name (default: English)"
     )
     parser.add_argument(
         "--author",
         default="Claude",
-        help="修订作者名称（默认: Claude）"
+        help="Track changes author name (default: Claude)"
     )
     parser.add_argument(
-        "--api-key",
-        help="Anthropic API密钥（可选，也可通过环境变量设置）"
-    )
-    parser.add_argument(
-        "--v2",
-        action="store_true",
-        help="使用 V2 语义驱动同步（推荐）"
+        "--preset",
+        choices=["zh-en", "en-zh", "zh-es", "es-en", "zh-ja", "ja-en"],
+        help="Language preset (overrides column and language settings)"
     )
 
     args = parser.parse_args()
 
-    # 创建引擎
+    # Apply preset if specified
+    if args.preset:
+        from .config import get_language_preset
+        preset = get_language_preset(args.preset)
+        args.source_column = preset["source_column"]
+        args.target_column = preset["target_column"]
+        args.source_lang = preset["source_lang"]
+        args.target_lang = preset["target_lang"]
+
+    # Create and run engine
     engine = BilingualSyncEngine(
         docx_path=args.input,
+        provider=args.provider,
         api_key=args.api_key,
+        model=args.model,
+        strategy=args.strategy,
         source_column=args.source_column,
         target_column=args.target_column,
         source_lang=args.source_lang,
@@ -429,14 +368,7 @@ def main():
         author=args.author
     )
 
-    # 执行同步
-    if args.v2:
-        print("使用 V2 语义驱动同步方案")
-        output_path = engine.sync_v2(args.output)
-    else:
-        print("使用 V1 传统同步方案（添加 --v2 使用新方案）")
-        output_path = engine.sync(args.output)
-
+    output_path = engine.sync(args.output)
     return output_path
 
 

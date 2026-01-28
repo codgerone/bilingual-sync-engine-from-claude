@@ -1,21 +1,21 @@
 """
-双语Word文档Track Changes同步引擎
+Bilingual Word Document Track Changes Sync Engine
 
-一个自动化工具，用于同步双语Word文档中的track changes。
+Automatically sync track changes from one language column to another
+in bilingual Word documents.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "Meiqi Jiang"
 
 from .extractor import RevisionExtractor
 from .mapper import RevisionMapper
-from .applier import RevisionApplier, SmartRevisionApplier
+from .applier import DiffBasedApplier
 from .engine import BilingualSyncEngine
 
 __all__ = [
     'RevisionExtractor',
     'RevisionMapper',
-    'RevisionApplier',
-    'SmartRevisionApplier',
+    'DiffBasedApplier',
     'BilingualSyncEngine',
 ]

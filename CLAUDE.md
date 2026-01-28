@@ -8,6 +8,8 @@ This is a **Bilingual Word Document Track Changes Synchronization Engine** that 
 
 **Core workflow**: Extract track changes from source column → Use LLM to map revisions to target language → Apply track changes to target column
 
+**Key feature**: Supports multiple LLM providers (Anthropic, DeepSeek, Qwen, Wenxin, Doubao, Zhipu, OpenAI) with two mapping strategies (max_tokens and batch).
+
 ## Essential Commands
 
 ### Environment Setup
@@ -20,101 +22,127 @@ source .venv/bin/activate  # Linux/Mac
 # Install dependencies
 pip install -r requirements.txt
 
-# Set API key
+# Set API key (choose one provider)
 export ANTHROPIC_API_KEY='your-key-here'  # Linux/Mac
 set ANTHROPIC_API_KEY=your-key-here  # Windows
+
+# Or use other providers
+set DEEPSEEK_API_KEY=your-key-here
+set QWEN_API_KEY=your-key-here
 ```
 
 ### Running the Engine
 
-**Basic usage (as library)**:
+**Basic usage**:
 ```bash
 python -m src.engine input.docx -o output.docx
 ```
 
-**With custom parameters**:
+**With LLM provider and strategy**:
 ```bash
 python -m src.engine input.docx \
+  --provider deepseek \
+  --strategy batch \
+  --preset zh-en
+```
+
+**Full options**:
+```bash
+python -m src.engine input.docx \
+  --provider anthropic \
+  --model claude-sonnet-4-20250514 \
+  --strategy max_tokens \
   --source-column 0 \
   --target-column 1 \
-  --source-lang "中文" \
-  --target-lang "英文" \
+  --source-lang "Chinese" \
+  --target-lang "English" \
   --author "Claude"
 ```
 
-**Run examples**:
+**Run benchmark**:
 ```bash
-python examples/example_usage.py
+python tests/benchmark_mapper.py
 ```
 
 ### Development Commands
 ```bash
 # No build process - pure Python project
 
-# Manual testing with specific document
-python -c "from src.engine import BilingualSyncEngine; BilingualSyncEngine('test.docx').sync()"
-
 # Debug mode (view extraction details)
 python src/extractor.py  # Run extractor standalone
 python src/mapper.py     # Run mapper standalone
-python src/applier.py    # Run applier standalone
+python src/applier.py    # Run applier standalone (word diff demo)
 ```
 
 ## Architecture Overview
 
 ### Three-Module Pipeline
 
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    BilingualSyncEngine                      │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        v                   v                   v
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Extractor   │ ─> │    Mapper    │ ─> │   Applier    │
+│  (XML parse) │    │  (LLM call)  │    │ (word diff)  │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
+
 1. **RevisionExtractor** (`src/extractor.py`)
    - Parses OOXML (Word's XML format) using defusedxml
    - Navigates table structure: `<w:tbl>` → `<w:tr>` → `<w:tc>`
    - Identifies track changes: `<w:del>` (deletions) and `<w:ins>` (insertions)
-   - Pairs consecutive deletions/insertions as revisions
-   - Extracts context (30 chars before/after) for LLM mapping
+   - Extracts before/after text versions from source column
 
 2. **RevisionMapper** (`src/mapper.py`)
-   - Uses Anthropic Claude API (default: claude-sonnet-4-20250514)
-   - Sends revision + context + target text to LLM
-   - Returns JSON with target language deletion/insertion/confidence
-   - Temperature set to 0.0 for deterministic output
+   - Unified multi-LLM mapper supporting 7 providers
+   - Two strategies: "max_tokens" (每次调用顶格输出，正则抢救) and "batch" (预估批次，json.loads)
+   - LLM Client abstraction layer: `LLMClient` → `AnthropicClient`, `OpenAICompatibleClient`, `WenxinClient`
+   - Factory function `create_llm_client()` for easy provider switching
+   - Temperature 0.0 for deterministic output
 
-3. **SmartRevisionApplier** (`src/applier.py`)
-   - Uses Document Library from `/mnt/skills/public/docx` (docx skill dependency)
-   - Finds deletion text in target column XML
-   - Intelligently splits text into: before + deletion + insertion + after
+3. **DiffBasedApplier** (`src/applier.py`)
+   - Uses word-level diff (difflib.SequenceMatcher) to find changes
+   - Supports both Chinese (jieba) and English tokenization
    - Generates OOXML-compliant track change XML
-   - Auto-manages revision IDs (finds max ID in document, increments from there)
+   - Auto-manages revision IDs (finds max ID in document, increments)
+   - Uses Document Library from `/mnt/skills/public/docx`
 
 ### Main Engine (`src/engine.py`)
 Orchestrates the pipeline:
 1. Unpacks .docx (ZIP) to XML files
 2. Initializes three modules
 3. Extracts source revisions
-4. Maps each revision via LLM
-5. Applies to target column
+4. Maps revisions via LLM (max_tokens or batch strategy)
+5. Applies word-level diff to target column
 6. Repacks to .docx
 7. Verifies with pandoc (optional)
 
 ### Key Design Patterns
+
+**Multi-LLM Architecture**:
+- Abstract `LLMClient` base class with `call()` and `call_with_cache()` methods
+- `AnthropicClient`: Native Anthropic API with prompt caching support
+- `OpenAICompatibleClient`: Works with DeepSeek, Qwen, Doubao, Zhipu, OpenAI
+- `WenxinClient`: Baidu Wenxin native API with OAuth token management
+
+**Dual Strategy Pattern**:
+- `strategy="max_tokens"`: 每次调用顶格输出到 token 上限，正则抢救解析，剩余行继续下次调用
+- `strategy="batch"`: Pre-estimated batches, json.loads parsing, retry with shrinking batches
 
 **Unpack/Pack workflow**:
 - Word .docx files are ZIP archives containing XML
 - Uses docx skill scripts: `/mnt/skills/public/docx/ooxml/scripts/unpack.py` and `pack.py`
 - Working directory: `{docx_path}_work/unpacked/`
 
-**XML manipulation**:
-- Read: defusedxml minidom for safe parsing
-- Write: Document Library (from docx skill) for OOXML compliance
-- Critical: maintain proper element order and attributes for Word compatibility
-
 **Revision ID management**:
 - Each track change needs unique `w:id` attribute
-- Engine scans existing IDs with regex `w:id="(\d+)"`
+- Applier scans existing IDs with regex `w:id="(\d+)"`
 - New revisions use `max_id + 1`, `max_id + 2`, etc.
-
-**Context-aware mapping**:
-- Extractor provides 30-char context before/after each revision
-- Helps LLM locate correct position in target language text
-- LLM prompt emphasizes semantic equivalence, not literal translation
 
 ## Critical Implementation Details
 
@@ -157,64 +185,69 @@ This project requires the docx skill's Document Library:
 
 ## Configuration
 
-### Language Presets (`src/config.py`)
+### Multi-LLM Provider Settings (`src/config.py`)
+
+| Provider | Environment Variable | Default Model | API Type |
+|----------|---------------------|---------------|----------|
+| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native |
+| DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI Compatible |
+| Qwen | `QWEN_API_KEY` | qwen-plus | OpenAI Compatible |
+| Wenxin | `WENXIN_API_KEY` + `WENXIN_SECRET_KEY` | ernie-4.0 | Native |
+| Doubao | `DOUBAO_API_KEY` | doubao-pro-32k | OpenAI Compatible |
+| Zhipu | `ZHIPU_API_KEY` | glm-4 | OpenAI Compatible |
+| OpenAI | `OPENAI_API_KEY` | gpt-4o | OpenAI Compatible |
+
+### Language Presets
 ```python
 LANGUAGE_PRESETS = {
-    "zh-en": {"source_lang": "中文", "target_lang": "英文", "source_column": 0, "target_column": 1},
-    "en-zh": {"source_lang": "英文", "target_lang": "中文", "source_column": 1, "target_column": 0},
+    "zh-en": {"source_lang": "Chinese", "target_lang": "English", "source_column": 0, "target_column": 1},
+    "en-zh": {"source_lang": "English", "target_lang": "Chinese", "source_column": 1, "target_column": 0},
     # ... more presets
 }
 ```
 
 ### Key Config Constants
-- `ANTHROPIC_MODEL`: "claude-sonnet-4-20250514"
 - `LLM_TEMPERATURE`: 0.0 (deterministic)
-- `LLM_MAX_TOKENS`: 1000
-- `CONTEXT_BEFORE_CHARS`: 30
-- `CONTEXT_AFTER_CHARS`: 30
+- `LLM_MAX_TOKENS`: 4096
+- `DEFAULT_PROVIDER`: "anthropic"
+- `DEFAULT_STRATEGY`: "max_tokens"
 
 ## Common Issues and Solutions
 
 ### Issue: Revision not found in target text
-**Cause**: LLM returned deletion text that doesn't exist in target column
+**Cause**: LLM returned text that doesn't match target column
 **Solution**:
-- Check `_extract_text_from_node()` in applier.py
-- May need fuzzy matching or better context
-- Consider increasing context window size
+- Check word_diff() tokenization in applier.py
+- May need fuzzy matching for edge cases
+- Try different LLM provider for better translation quality
 
 ### Issue: XML format errors after packing
 **Cause**: Generated XML doesn't conform to OOXML schema
 **Solution**:
-- Ensure proper element nesting in `_build_smart_revision_xml()`
+- Ensure proper element nesting in `_build_diff_xml()`
 - Use `xml:space="preserve"` for text with leading/trailing spaces
 - Verify all required attributes are present
 
-### Issue: Incorrect revision pairing
-**Cause**: `_pair_deletions_insertions()` logic assumes adjacent del/ins
+### Issue: Batch strategy losing rows
+**Cause**: Output truncated mid-JSON or LLM didn't process all rows
 **Solution**:
-- Some documents have non-adjacent revisions
-- May need to enhance pairing logic with position tracking
-- Check paragraph structure in document.xml
-
-### Issue: Missing modifications after sync
-**Cause**: Extractor couldn't pair deletion with insertion
-**Solution**:
-- Standalone deletions or insertions might be skipped
-- Enhance `_pair_deletions_insertions()` to handle unpaired revisions
-- Log extraction details for debugging
+- Retry logic automatically re-processes failed rows
+- Consider reducing `output_safety_ratio` for more conservative batching
+- Switch to "max_tokens" strategy for speed-critical documents
 
 ## Development Guidelines
 
 ### When modifying extraction logic (extractor.py):
 - Test with various document structures (nested tables, merged cells)
 - Verify HTML entity decoding for non-ASCII languages
-- Check context extraction doesn't truncate mid-character
+- Check that before/after text extraction handles all node types
 
 ### When modifying LLM prompts (mapper.py):
 - Keep temperature at 0.0 for consistency
 - Always request JSON output format
 - Include confidence score in response schema
 - Test with edge cases (empty strings, special characters)
+- Test across multiple providers (prompt behavior varies)
 
 ### When modifying XML generation (applier.py):
 - Always preserve original text formatting (rPr nodes)
@@ -222,7 +255,14 @@ LANGUAGE_PRESETS = {
 - Verify revision IDs are truly unique
 - Use Document Library's validation if available
 
+### When adding new LLM providers:
+- If OpenAI-compatible: Add to `PROVIDERS` dict in `create_llm_client()`
+- If native API: Create new `LLMClient` subclass
+- Add provider config to `LLM_PROVIDERS` in config.py
+- Test with benchmark_mapper.py
+
 ### Testing approach:
+- Run `python tests/benchmark_mapper.py` to test mapper
 - Create minimal test documents with known revisions
 - Compare output with manually created track changes
 - Use pandoc to convert to markdown and verify visually
@@ -231,15 +271,29 @@ LANGUAGE_PRESETS = {
 ## File Organization
 
 ```
-src/
-├── extractor.py    # XML parsing, revision extraction (no external API calls)
-├── mapper.py       # LLM API integration (only module that calls Anthropic)
-├── applier.py      # XML generation, Document Library usage
-├── engine.py       # Orchestration, unpack/pack, CLI
-└── config.py       # Constants, presets, environment vars
-
-examples/
-└── example_usage.py  # Interactive examples (useful for testing)
+bilingual-sync-engine/
+├── src/                    # Core source code
+│   ├── __init__.py        # Package exports (v2.0.0)
+│   ├── config.py          # Multi-LLM config, language presets
+│   ├── extractor.py       # XML parsing, revision extraction
+│   ├── mapper.py          # Multi-LLM mapping (7 providers, 2 strategies)
+│   ├── applier.py         # Word-level diff, track changes generation
+│   └── engine.py          # Orchestration, CLI, unpack/pack
+│
+├── tests/
+│   └── benchmark_mapper.py # Provider/strategy benchmarks
+│
+├── docs/
+│   ├── DATA_FLOW.md       # Complete pipeline documentation
+│   └── KNOWLEDGE_MAP.md   # Technical concepts for beginners
+│
+├── examples/
+│   └── example_usage.py   # Interactive usage examples
+│
+├── CLAUDE.md              # This file
+├── CONVERSATION_MEMORY.md # Learning progress tracking
+├── README.md              # Project readme
+└── requirements.txt       # Python dependencies
 ```
 
 **Module independence**:
@@ -252,7 +306,10 @@ examples/
 
 **Python packages** (requirements.txt):
 - `anthropic>=0.18.0` - Claude API client
+- `openai>=1.0.0` - OpenAI-compatible API client (DeepSeek, Qwen, etc.)
 - `defusedxml>=0.7.1` - Safe XML parsing (security)
+- `jieba>=0.42.1` - Chinese word segmentation
+- `requests>=2.28.0` - HTTP client (for Wenxin API)
 - `tqdm>=4.65.0` - Progress bars (optional)
 - `loguru>=0.7.0` - Logging (optional)
 
@@ -261,22 +318,8 @@ examples/
 - docx skill - Document Library for OOXML operations
 
 **API requirements**:
-- Anthropic API key (set ANTHROPIC_API_KEY environment variable)
+- At least one LLM provider API key
 - Internet connection for API calls
-
-## Performance Characteristics
-
-- **Small docs (1-5 pages, 1-10 revisions)**: ~30 seconds
-- **Medium docs (10-20 pages, 10-30 revisions)**: ~2 minutes
-- **Large docs (50+ pages, 50+ revisions)**: ~5 minutes
-
-**Bottleneck**: LLM API calls (one per revision, sequential)
-
-**Optimization opportunities**:
-- Batch multiple revisions in single LLM call
-- Cache identical revisions
-- Parallel processing for multiple documents
-- Only process new revisions (incremental mode)
 
 ## Notes for Future Developers
 
@@ -292,7 +335,9 @@ examples/
 
 6. **Error handling**: Current implementation logs errors but continues processing remaining revisions
 
-7. **Language support**: Works with any language pair Claude API supports, not limited to Chinese/English
+7. **Language support**: Works with any language pair that the chosen LLM provider supports
+
+8. **Provider switching**: To switch providers, just set the corresponding environment variable and use `--provider` flag
 
 
 ## Meiqi添加的项目记忆

@@ -4,233 +4,198 @@
 
 ---
 
-## 📅 最近更新：2026-01-18
+## 📅 最近更新：2026-01-28
 
-### 当前学习进度
+### 当前项目状态
 
-**阶段**：mapper.py 批量处理优化方案设计（讨论中）
+**阶段**：项目重塑完成，进入稳定使用阶段
 
-**已完成**：
-- ✅ 理解 minidom 的基本概念
-- ✅ 理解 extractor.py 各函数的输入输出
-- ✅ 讨论并确定了 V2 重塑方案（语义驱动）
-- ✅ 清理 extractor.py - 删除所有 V1 代码，只保留 V2
-- ✅ 重构 extractor.py - 打包提取 + 快速检查优化
-- ✅ 清理 mapper.py - 删除 V1 代码
-- ✅ 生成 mapper.py 知识地图 - 详细介绍 API、Prompt 工程、JSON 解析
-- ✅ 实现 Prompt Caching 优化 - 节省约 60% API 成本
-- ✅ **深入讨论批量处理优化方案** - 对比单行调用 vs 批量调用
-
-**进行中**：
-- 🔄 批量处理优化方案设计（待实现）
+**项目结构**：
+```
+bilingual-sync-engine/
+├── src/
+│   ├── __init__.py        # v2.0.0
+│   ├── config.py          # 多 LLM 提供商配置
+│   ├── extractor.py       # XML 解析，修订提取
+│   ├── mapper.py          # 统一 mapper（7 提供商，2 策略）
+│   ├── applier.py         # 词级别 diff，track changes 生成
+│   └── engine.py          # 主引擎，CLI
+├── tests/
+│   └── benchmark_mapper.py
+├── docs/
+│   ├── DATA_FLOW.md
+│   └── KNOWLEDGE_MAP.md
+└── examples/
+    └── example_usage.py
+```
 
 ---
 
-### 🎯 批量处理优化方案讨论（2026-01-18）
+### 🎯 2026-01-28 对话记录：策略描述修正
 
-#### 背景问题
+#### 问题
 
-Meiqi 提出：当前 mapper.py 对每一行单独调用 API，是否浪费资源和时间？
+在之前的重塑过程中，我对 `max_tokens` 策略的描述有严重误导：
+- 错误描述："ALL rows in ONE API call"（所有行在一次 API 调用中完成）
+- 用户纠正：这不是说全过程只调一次 API！
 
-#### 数据对比（100 行文档）
+#### 用户的核心观点
 
-| 指标 | 单行调用（当前） | 批量调用 | 差异 |
-|------|-----------------|---------|------|
-| 输入 Token | ~24,000 | ~16,000 | 批量省 33% |
-| API 调用次数 | 100 次 | 1 次 | 批量快 100 倍 |
-| 处理时间 | 100-200 秒 | 5-10 秒 | 批量快 10-20 倍 |
+> "单次调用 API 达到输出上限才停止这个方案，并不是说全过程只调用一次 API。面对特别长的文档不可能只调用一次 API 就完成所有工作，肯定还是得分批处理，只不过在每次调用 API 的时候，一直使用到输出极限，让 LLM 顶格输出才停止。"
 
-#### Meiqi 的核心观点
+#### 正确理解
 
-1. **速度至上原则**：能有多快就要多快，速度问题导致的其他问题另想办法解决
-2. **错误预防优先**：在 extractor 阶段就尽量规避映射时的错误
-3. **精准重试**：批量失败时，只重试出错的行，不重试成功的行
-4. **输入格式**：直接用 JSON，不做预处理转换（节省资源）
-
-#### 关键技术澄清
-
-Claude 指出一个重要限制：**我们无法控制 LLM 输出多少 token，只能控制输入**
-
-- `max_tokens` 是上限，不是目标
-- 如果输出超过上限 → 被截断 → JSON 不完整 → 解析失败
-- 正确做法：控制输入行数，使预期输出不超过上限
-
-#### 讨论中的综合方案
-
+**max_tokens 策略的真正含义**：
 ```
-1. 预处理（extractor 阶段）
-   ├── 过滤空行
-   ├── 标记超长行
-   └── 验证数据完整性
-
-2. 动态分批
-   ├── 估算每行输出 token 数
-   ├── 计算安全批次大小（目标：输出 < 80% 上限）
-   └── 超长行单独处理
-
-3. 容错解析
-   ├── 尝试完整 JSON 解析
-   ├── 失败则逐个提取成功的行
-   └── 记录失败的 row 号
-
-4. 精准重试
-   ├── 只重试失败的行
-   └── 用更小批次（更保守）
+第1次调用: 发送待处理行 → 输出到 token 上限被截断 → 正则抢救 → 拿到一部分结果
+第2次调用: 只发送剩余行 → 输出到 token 上限 → 抢救 → 又拿到一部分
+第3次调用: 再发剩余行 → ...
+直到全部完成
 ```
 
-#### 待讨论的问题
+- 对于短文档：可能一次调用就够
+- 对于长文档：会自动分多次调用完成
+- 核心思想：**每次调用都顶格输出**，不提前估算批次大小
 
-1. 动态批次的"估算 + 动态调整"方案是否可行？
-2. 超过 1000 字符的超长行如何处理？
-3. 单行最多重试几次？
+#### 代码逻辑确认
 
-#### Meiqi 的下一步计划
+实际上 `_map_max_tokens_strategy()` 的代码逻辑是正确的——retry 循环就是处理多次调用的机制。问题只是描述文字误导。
 
-将本次讨论内容与其他 LLM 进行探讨，兼听则明。
+#### 修正的文件
+
+| 文件 | 修正内容 |
+|------|---------|
+| `src/mapper.py` | 架构图、Strategies 说明、类 docstring、方法 docstring、print 信息 |
+| `src/engine.py` | `__init__` docstring、CLI `--strategy` 帮助文本 |
+| `CLAUDE.md` | 策略描述 |
+| `docs/DATA_FLOW.md` | 策略表格、函数树注释 |
+| `README.md` | CLI 选项说明 |
+
+#### 修正后的策略描述
+
+| 策略 | 描述 |
+|------|------|
+| `max_tokens` | 每次调用顶格输出到 token 上限，正则抢救解析，剩余行继续下次调用 |
+| `batch` | 预估批次大小，json.loads 解析，失败时缩小批次重试 |
 
 ---
 
-### 🎯 mapper.py 重构要点（2026-01-10）
+### 🎯 2026-01-22/28 项目重塑完成
 
-**1. 清理 V1 代码**
-- 删除 `map_revision()`, `map_revisions_batch()` 等旧方法
-- 只保留 V2 的 `map_text_revision()`, `map_row_pairs()`
+#### 完成的工作
 
-**2. Prompt Caching 优化**
+1. **Mapper 模块重塑**
+   - 合并 `mapper.py` 和 `mapper2_from_codex.py` 为统一的 `mapper.py`
+   - 支持 7 个 LLM 提供商：Anthropic、DeepSeek、Qwen、Wenxin、Doubao、Zhipu、OpenAI
+   - 两种策略：`max_tokens`（默认）和 `batch`
+   - LLM Client 抽象层：`LLMClient` → `AnthropicClient`, `OpenAICompatibleClient`, `WenxinClient`
 
-Meiqi 提出的问题：每行修订都发送完整 prompt，重复的部分（角色、原则、格式）是否浪费 token？
+2. **配置模块更新**
+   - `config.py` 添加 `LLM_PROVIDERS` 字典（7 个提供商配置）
+   - `LANGUAGE_PRESETS` 语言预设
+   - `DEFAULT_STRATEGY = "max_tokens"`
+   - `LLM_MAX_TOKENS = 4096`
 
-**答案**：是的！输入 token 也消耗费用。
+3. **文档整理**
+   - 创建 `docs/DATA_FLOW.md`（完整管道文档）
+   - 创建 `docs/KNOWLEDGE_MAP.md`（合并两个知识地图）
+   - 更新 `README.md`、`CLAUDE.md`
 
-**解决方案**：使用 Anthropic Prompt Caching
+4. **文件清理**（删除 13+ 文件）
+   - `mapper2_from_codex.py`
+   - 学习用测试文件
+   - 旧文档文件
 
-```
-优化前：每行都发送 ~600 tokens
-调用1: [角色+原则+格式](450) + [数据](150)
-调用2: [角色+原则+格式](450) + [数据](150)  ← 重复！
-
-优化后：固定部分缓存
-调用1: [system prompt 创建缓存](450×1.25) + [数据](150)
-调用2: [读取缓存](450×0.1) + [数据](150)  ← 便宜 90%！
-```
-
-**新增方法**：
-- `_build_system_prompt()` - 构建可缓存的系统提示（含 3 个 few-shot 示例）
-- `_build_user_message()` - 构建每行变化的用户消息
-
-**关键代码**：
-```python
-response = client.messages.create(
-    system=[{
-        "type": "text",
-        "text": "固定内容...",
-        "cache_control": {"type": "ephemeral"}  # 关键：标记缓存
-    }],
-    messages=[{"role": "user", "content": "变化内容..."}]
-)
-```
-
-**3. 关键学习：Token 消耗机制**
-
-| 类型 | 内容 | 消耗 |
-|------|------|------|
-| 输入 token | 你发送的 prompt | ✅ 消耗（较便宜） |
-| 输出 token | LLM 生成的回复 | ✅ 消耗（较贵，约 5 倍） |
+5. **基准测试**
+   - 创建 `tests/benchmark_mapper.py`
 
 ---
 
-### 📁 mapper.py 当前结构
+### 📁 当前 mapper.py 结构
 
 ```
 RevisionMapper 类
-├── __init__(api_key, model)           # 初始化客户端 + 缓存变量
+├── __init__(provider, api_key, model, strategy, max_output_tokens)
 │
-├── map_row_pairs()                    # 主入口：处理 extractor 输出的行对
-├── map_text_revision()                # 单行映射：调用 LLM API（使用缓存）
+├── map_row_pairs()                    # 主入口
+│   ├── _map_max_tokens_strategy()     # 每次调用顶格输出，正则抢救
+│   │       └── _salvage_objects()     # 正则提取完整 JSON 对象
+│   └── _map_batch_strategy()          # 预估批次，json.loads
+│           ├── _build_batches()
+│           └── _map_single_batch()
 │
-├── _parse_text_response()             # 解析 JSON 响应
+├── map_text_revision()                # 单行便捷方法（包装为列表调用 map_row_pairs）
 │
-└── Prompt Caching 相关
-    ├── _build_system_prompt()         # 构建可缓存的系统提示（固定部分）
-    └── _build_user_message()          # 构建用户消息（变化部分）
+└── LLM Client 层
+    ├── LLMClient (ABC)                # 抽象基类
+    ├── AnthropicClient               # 原生 Anthropic API，支持 Prompt Caching
+    ├── OpenAICompatibleClient        # DeepSeek/Qwen/Doubao/Zhipu/OpenAI
+    └── WenxinClient                  # 百度文心，OAuth 令牌管理
 ```
 
 ---
 
-### 📝 学习方法约定
+### 📝 重要学习点
 
-根据 CLAUDE.md 中的约定：
-1. **先全局后局部**：对于新知识点，先生成一页纸知识地图，再逐个深入
-2. **文字优先**：能用文字解释的不要生成测试代码，除非代码效果明显更好
-3. **聚焦提问**：一次最多围绕一个知识点提 1-3 个问题
+1. **max_tokens 策略 ≠ 只调一次 API**
+   - 每次调用顶格输出，用满输出配额
+   - 长文档会自动分多次调用
+   - 关键是"每次都用满"，不是"只用一次"
+
+2. **正则抢救模式**
+   - 输出被截断时，最后一个 JSON 对象可能不完整
+   - 用正则 `r"\{[^{}]*\"row_index\"\s*:\s*\d+[^{}]*\}"` 提取完整对象
+   - 丢弃最后一个对象（截断不可信），剩余行重试
+
+3. **多 LLM 提供商支持**
+   - Anthropic：原生 API，支持 Prompt Caching
+   - DeepSeek/Qwen/Doubao/Zhipu/OpenAI：OpenAI 兼容格式
+   - Wenxin：原生 API，需要 OAuth 令牌
 
 ---
 
-### ⏭️ 下次对话继续的内容
+### ⏭️ 下次对话可继续的内容
 
-1. 继续深入学习 mapper.py 的其他细节（如有问题）
-2. 学习 applier.py
-3. 学习 engine.py
-4. 用真实双语 Word 文档测试完整流程
+1. 用真实双语 Word 文档测试完整流程
+2. 运行 `tests/benchmark_mapper.py` 对比提供商性能
+3. 深入学习 `applier.py` 的词级别 diff 实现
+4. 讨论产品化方向
 
 ---
 
 ## 📜 历史记录归档
 
+### 2026-01-18：批量处理优化方案讨论
+
+- Meiqi 提出当前 mapper.py 对每行单独调用 API 浪费资源
+- 讨论了单行调用 vs 批量调用的数据对比
+- Meiqi 核心观点：速度至上、错误预防、精准重试
+- 讨论了动态分批、容错解析等方案
+- 此讨论内容在 2026-01-22 的项目重塑中实现
+
+### 2026-01-10：mapper.py 重构 & Prompt Caching
+
+- 清理 V1 代码，只保留 V2
+- 实现 Prompt Caching 优化（节省约 60% API 成本）
+- 学习 Token 消耗机制
+
 ### 2026-01-08：extractor.py 重构完成
 
-**完成的工作**：
-- 清理 extractor.py 中的 V1 代码
+- 清理 V1 代码
 - 实现打包提取（`extract_row_pairs()`）
 - 新增快速检查优化（`_has_revisions()`）
-- 添加文件结构图到 extractor.py 开头
 
 ### 2026-01-07：V2 重塑方案实现
 
-**完成的工作**：
-- 重塑 extractor.py - 输出 before_text/after_text
-- 重塑 mapper.py - 新 prompt 让 LLM 理解语义差异
-- 重塑 applier.py - 词级别 diff（jieba 分词）
-- 调整 engine.py - 新增 sync_v2() 方法
-- 添加 jieba 依赖到 requirements.txt
-
-**V2 核心思想**：
-- Meiqi 的洞察：翻译是语义对应，不是词汇对应
-- extractor 输出 `{before_text, after_text}` 而非 `{deletion, insertion}`
-- mapper 让 LLM 看完整句子，理解语义差异
+- 核心洞察：翻译是语义对应，不是词汇对应
+- extractor 输出 `{before_text, after_text}`
 - applier 用词级别 diff 生成 track changes
 
-### 2026-01-06：minidom 学习 & V2 设计讨论
+### 2026-01-06：minidom 学习 & 项目初始化
 
-**学习内容**：
-- 理解 minidom 的基本概念（Document, Element, Text, NodeList）
-- 理解"空白字符也是文本节点"这个陷阱
-- 理解 `firstChild`, `childNodes`, `getElementsByTagName` 的区别
-
-**重要发现**：
-- Meiqi 发现原 `_pair_deletions_insertions()` 方法设计有缺陷
-- 核心洞察：翻译是语义对应，不是词汇对应
-- 决定重塑为 V2 语义驱动方案
-
-### 2026-01-06之前：项目初始化
-
+- 理解 minidom 基本概念
 - 项目从 Claude 网页端生成
-- 目标：开发双语 Word 文档 track changes 自动同步引擎
 - Meiqi 的学习目标：通过实际项目学习 coding、Python、AI 产品开发
-
----
-
-## 📁 学习过程中创建的文件
-
-| 文件名 | 用途 |
-|-------|------|
-| `minidom_knowledge_map.md` | minidom 一页纸知识地图 |
-| `mapper_knowledge_map.md` | mapper.py 知识地图（API、Prompt工程、JSON、Prompt Caching） |
-| `conversation_2026-01-18_batch_processing.md` | 批量处理优化方案讨论完整记录（供与其他 LLM 讨论） |
-| `test.py` | 测试 minidom 基本用法 |
-| `test_of_minidom.py` | 详细的 minidom 演示代码 |
-| `test_nodelist.py` | 测试 NodeList 和 Element 的区别 |
-| `test_method_vs_attribute.py` | 测试 method 和 attribute 的区别 |
 
 ---
 

@@ -1,437 +1,919 @@
 """
 ================================================================================
-LLM 映射器 - 使用大语言模型将修订映射到目标语言
+LLM Mapper - Multi-Provider Revision Mapping with Dual Strategies
 ================================================================================
 
-模块定位
---------
-这是三模块管道中唯一调用外部 API 的模块：
+Architecture Overview
+---------------------
 
-    extractor.py ──→ mapper.py ──→ applier.py
-    (提取修订)       (LLM映射)      (应用修订)
-                        ↓
-                   Anthropic API
+                    +-----------------------+
+                    |    RevisionMapper     |  <-- Main Entry Point
+                    |   (strategy switch)   |
+                    +-----------+-----------+
+                                |
+          +---------------------+---------------------+
+          |                                           |
+          v                                           v
+    +-------------+                           +-------------+
+    | "max_tokens"|                           |   "batch"   |
+    |  Strategy   |                           |   Strategy  |
+    +-------------+                           +-------------+
+    每次调用顶格输出                          预估批次大小
+    直到 token 上限                           控制在预算内
+    正则抢救解析                              json.loads 解析
+    剩余行继续下次调用                        失败时缩小批次重试
+          |                                           |
+          +---------------------+---------------------+
+                                |
+                                v
+                    +-----------------------+
+                    |      LLMClient        |  <-- Abstract Base
+                    |  (provider agnostic)  |
+                    +-----------------------+
+                                |
+     +-----------+-------+------+------+------+------+
+     |           |       |      |      |      |      |
+     v           v       v      v      v      v      v
+  Anthropic  DeepSeek  Qwen  Wenxin Doubao  Zhipu  OpenAI
+   Client     Client  Client Client Client Client Client
 
-核心职责
---------
-1. 理解源语言修订前后的语义差异
-2. 在目标语言中做最小改动以反映相同的语义变化
-3. 返回目标语言的修订后完整文本
-
-数据流
-------
-输入（来自 extractor）:
+Data Flow
+---------
+Input (from extractor):
     {
-        'source_before': '修订前的源语言文本',
-        'source_after': '修订后的源语言文本',
-        'target_current': '目标语言当前文本'
+        'row_index': int,
+        'source_before': str,
+        'source_after': str,
+        'target_current': str
     }
 
-输出（给 applier）:
+Output (to applier):
     {
-        'target_after': 'LLM 生成的目标语言修订后文本',
-        'explanation': 'LLM 的解释',
-        'confidence': 0.95
+        'row_index': int,
+        'target_current': str,
+        'target_after': str,
+        'explanation': str,
+        'confidence': float
     }
 
-设计原则
---------
-- 语义驱动：翻译是语义对应，不是词汇对应
-- 最小改动：只改必须改的部分
-- 确定性输出：temperature=0.0 保证相同输入得到相同输出
+Strategies
+----------
+1. "max_tokens" - 每次调用顶格输出到 token 上限
+   - 特点: 速度最快，每次调用都用满输出配额
+   - 解析: 正则抢救 (从截断输出中提取完整 JSON 对象)
+   - 重试: 剩余未完成的行进入下一次调用
 
-性能优化：Prompt Caching
-------------------------
-使用 Anthropic Prompt Caching 功能优化 API 调用效率：
+2. "batch" - 预估批次大小，控制在输出预算内
+   - 特点: 解析可靠，行为可预测
+   - 解析: json.loads (批次大小确保输出不会截断)
+   - 重试: 缩小预算重新分批
 
-    优化前：每行都发送完整 prompt（~600 tokens）
-    ┌─────────────────────────────────────────────┐
-    │ [角色+背景+原则+格式] + [数据]  → API 调用 1 │
-    │ [角色+背景+原则+格式] + [数据]  → API 调用 2 │
-    │ ...重复发送相同的固定内容...                │
-    └─────────────────────────────────────────────┘
-
-    优化后：固定部分缓存，只发送变化数据
-    ┌─────────────────────────────────────────────┐
-    │ [system prompt 创建缓存] + [数据] → 调用 1  │
-    │ [读取缓存(0.1x成本)] + [数据]     → 调用 2  │
-    │ ...后续调用节省约 60% 成本...               │
-    └─────────────────────────────────────────────┘
-
-关键实现：
-- system 参数：固定内容（角色、原则、示例），带 cache_control 标记
-- messages 参数：变化内容（每行的 before/after/current）
-- 缓存有效期：5 分钟（Anthropic 默认）
 ================================================================================
 """
 
-import anthropic
-from typing import Dict, List
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Dict, List, Any, Optional, Tuple
 import json
+import re
+import os
 
 
-class RevisionMapper:
+# ================================================================================
+# LLM Client Abstraction Layer
+# ================================================================================
+
+class LLMClient(ABC):
     """
-    使用 LLM 将修订从源语言映射到目标语言
+    Abstract base class for LLM API clients.
 
-    结构图
-    ------
-    RevisionMapper
-    ├── __init__(api_key, model)           # 初始化客户端 + 缓存变量
-    │
-    ├── map_row_pairs()                    # 主入口：处理 extractor 输出的行对
-    ├── map_text_revision()                # 单行映射：调用 LLM API（使用缓存）
-    │
-    ├── _parse_text_response()             # 解析 JSON 响应
-    │
-    └── Prompt Caching 相关
-        ├── _build_system_prompt()         # 构建可缓存的系统提示（固定部分）
-        └── _build_user_message()          # 构建用户消息（变化部分）
+    Provides a unified interface for different LLM providers.
+    All providers must implement the call() method.
     """
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+    @abstractmethod
+    def call(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
         """
-        初始化映射器
+        Make an API call to the LLM.
 
         Args:
-            api_key: Anthropic API 密钥（从环境变量 ANTHROPIC_API_KEY 获取）
-            model: 使用的模型，默认 claude-sonnet-4-20250514
+            system_prompt: System/instruction prompt
+            user_message: User message content
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0.0 = deterministic)
+
+        Returns:
+            (response_text, stop_reason)
         """
+        pass
+
+    @abstractmethod
+    def call_with_cache(
+        self,
+        system_prompt_parts: List[Dict],
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        """
+        Make an API call with prompt caching support.
+
+        Args:
+            system_prompt_parts: List of prompt parts with cache_control
+            user_message: User message content
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+
+        Returns:
+            (response_text, stop_reason)
+        """
+        pass
+
+
+class AnthropicClient(LLMClient):
+    """Anthropic Claude API client."""
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+        import anthropic
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-        # Prompt Caching：缓存当前文档的 system prompt
-        # 同一文档内 source_lang/target_lang 固定，可以复用
-        self._cached_system_prompt = None
-        self._cached_source_lang = None
-        self._cached_target_lang = None
+    def call(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}]
+        )
+        return response.content[0].text, response.stop_reason
+
+    def call_with_cache(
+        self,
+        system_prompt_parts: List[Dict],
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt_parts,
+            messages=[{"role": "user", "content": user_message}]
+        )
+        return response.content[0].text, response.stop_reason
+
+
+class OpenAICompatibleClient(LLMClient):
+    """
+    OpenAI-compatible API client.
+
+    Works with: DeepSeek, Qwen, Doubao, Zhipu, and other OpenAI-compatible APIs.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        provider_name: str = "OpenAI-Compatible"
+    ):
+        from openai import OpenAI
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.provider_name = provider_name
+
+    def call(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+        )
+        return response.choices[0].message.content, response.choices[0].finish_reason
+
+    def call_with_cache(
+        self,
+        system_prompt_parts: List[Dict],
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        # OpenAI-compatible APIs don't support cache_control
+        # Combine parts into single system prompt
+        system_text = "".join(part.get("text", "") for part in system_prompt_parts)
+        return self.call(system_text, user_message, max_tokens, temperature)
+
+
+class WenxinClient(LLMClient):
+    """
+    Baidu Wenxin (ERNIE) API client.
+
+    Uses native Wenxin API format.
+    """
+
+    def __init__(self, api_key: str, secret_key: str, model: str = "ernie-4.0"):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.model = model
+        self._access_token = None
+
+    def _get_access_token(self) -> str:
+        """Get or refresh access token."""
+        if self._access_token:
+            return self._access_token
+
+        import requests
+        url = "https://aip.baidubce.com/oauth/2.0/token"
+        params = {
+            "grant_type": "client_credentials",
+            "client_id": self.api_key,
+            "client_secret": self.secret_key
+        }
+        response = requests.post(url, params=params)
+        self._access_token = response.json().get("access_token")
+        return self._access_token
+
+    def call(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        import requests
+
+        access_token = self._get_access_token()
+        url = f"https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{self.model}?access_token={access_token}"
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": f"{system_prompt}\n\n{user_message}"}
+            ],
+            "temperature": max(temperature, 0.01),  # Wenxin minimum is 0.01
+            "max_output_tokens": max_tokens
+        }
+
+        response = requests.post(url, json=payload)
+        result = response.json()
+
+        return result.get("result", ""), "stop"
+
+    def call_with_cache(
+        self,
+        system_prompt_parts: List[Dict],
+        user_message: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.0
+    ) -> Tuple[str, str]:
+        system_text = "".join(part.get("text", "") for part in system_prompt_parts)
+        return self.call(system_text, user_message, max_tokens, temperature)
+
+
+# ================================================================================
+# LLM Client Factory
+# ================================================================================
+
+def create_llm_client(
+    provider: str,
+    api_key: str = None,
+    model: str = None,
+    **kwargs
+) -> LLMClient:
+    """
+    Factory function to create LLM clients.
+
+    Args:
+        provider: Provider name (anthropic, deepseek, qwen, wenxin, doubao, zhipu, openai)
+        api_key: API key (defaults to environment variable)
+        model: Model name (defaults to provider's recommended model)
+        **kwargs: Additional provider-specific arguments
+
+    Returns:
+        LLMClient instance
+    """
+    provider = provider.lower()
+
+    # Provider configurations
+    PROVIDERS = {
+        "anthropic": {
+            "env_key": "ANTHROPIC_API_KEY",
+            "default_model": "claude-sonnet-4-20250514",
+            "client_class": AnthropicClient,
+        },
+        "deepseek": {
+            "env_key": "DEEPSEEK_API_KEY",
+            "default_model": "deepseek-chat",
+            "base_url": "https://api.deepseek.com",
+            "client_class": OpenAICompatibleClient,
+        },
+        "qwen": {
+            "env_key": "QWEN_API_KEY",
+            "default_model": "qwen-plus",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "client_class": OpenAICompatibleClient,
+        },
+        "doubao": {
+            "env_key": "DOUBAO_API_KEY",
+            "default_model": "doubao-pro-32k",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "client_class": OpenAICompatibleClient,
+        },
+        "zhipu": {
+            "env_key": "ZHIPU_API_KEY",
+            "default_model": "glm-4",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "client_class": OpenAICompatibleClient,
+        },
+        "openai": {
+            "env_key": "OPENAI_API_KEY",
+            "default_model": "gpt-4o",
+            "base_url": "https://api.openai.com/v1",
+            "client_class": OpenAICompatibleClient,
+        },
+    }
+
+    if provider not in PROVIDERS:
+        available = ", ".join(PROVIDERS.keys())
+        raise ValueError(f"Unknown provider: {provider}. Available: {available}")
+
+    config = PROVIDERS[provider]
+
+    # Get API key from parameter or environment
+    if api_key is None:
+        api_key = os.getenv(config["env_key"], "")
+        if not api_key:
+            raise ValueError(
+                f"API key required. Set {config['env_key']} environment variable "
+                f"or pass api_key parameter."
+            )
+
+    # Get model
+    if model is None:
+        model = config["default_model"]
+
+    # Special handling for Wenxin (needs secret_key)
+    if provider == "wenxin":
+        secret_key = kwargs.get("secret_key") or os.getenv("WENXIN_SECRET_KEY", "")
+        if not secret_key:
+            raise ValueError("Wenxin requires secret_key (set WENXIN_SECRET_KEY)")
+        return WenxinClient(api_key, secret_key, model)
+
+    # Create client
+    if config["client_class"] == AnthropicClient:
+        return AnthropicClient(api_key, model)
+    else:
+        return OpenAICompatibleClient(
+            api_key=api_key,
+            base_url=config["base_url"],
+            model=model,
+            provider_name=provider.capitalize()
+        )
+
+
+# ================================================================================
+# Revision Mapper - Main Class
+# ================================================================================
+
+class RevisionMapper:
+    """
+    Unified revision mapper with multi-LLM support and dual strategies.
+
+    Strategies:
+        - "max_tokens": 每次调用顶格输出到 token 上限，正则抢救解析，剩余行继续下次调用
+        - "batch": 预估批次大小，json.loads 解析，失败时缩小批次重试
+
+    Usage:
+        mapper = RevisionMapper(provider="deepseek", strategy="max_tokens")
+        results = mapper.map_row_pairs(row_pairs, source_lang="Chinese", target_lang="English")
+    """
+
+    def __init__(
+        self,
+        provider: str = "anthropic",
+        api_key: str = None,
+        model: str = None,
+        strategy: str = "max_tokens",
+        max_output_tokens: int = 4096,
+        # batch strategy parameters
+        output_safety_ratio: float = 0.7,
+        row_base_tokens: int = 80,
+        row_per_char: float = 0.2,
+        # shared retry parameters
+        max_retries: int = 2,
+        retry_shrink_ratio: float = 0.6,
+        **kwargs
+    ):
+        """
+        Initialize the mapper.
+
+        Args:
+            provider: LLM provider (anthropic, deepseek, qwen, etc.)
+            api_key: API key (or use environment variable)
+            model: Model name (or use provider default)
+            strategy: "max_tokens" or "batch"
+            max_output_tokens: Max tokens for API call output
+            output_safety_ratio: Safety margin for batch output budgeting
+            row_base_tokens: Base token cost per row estimate (batch strategy)
+            row_per_char: Token cost per character estimate (batch strategy)
+            max_retries: Max retry attempts for failed/missing rows
+            retry_shrink_ratio: Budget shrink ratio for retries
+        """
+        # Create LLM client
+        self.client = create_llm_client(provider, api_key, model, **kwargs)
+        self.provider = provider
+        self.strategy = strategy
+
+        # Output parameters
+        self.max_output_tokens = max_output_tokens
+
+        # Batch strategy parameters
+        self.output_safety_ratio = output_safety_ratio
+        self.row_base_tokens = row_base_tokens
+        self.row_per_char = row_per_char
+
+        # Shared retry parameters
+        self.max_retries = max_retries
+        self.retry_shrink_ratio = retry_shrink_ratio
+
+    # --------------------------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------------------------
+
+    def map_row_pairs(
+        self,
+        row_pairs: List[Dict[str, Any]],
+        source_lang: str = "Chinese",
+        target_lang: str = "English"
+    ) -> List[Dict[str, Any]]:
+        """
+        Main entry point: Map revisions for all rows.
+
+        Args:
+            row_pairs: List from extractor.extract_row_pairs()
+                      Each item: {row_index, source_before, source_after, target_current}
+            source_lang: Source language name
+            target_lang: Target language name
+
+        Returns:
+            List of mapping results:
+            {row_index, target_current, target_after, explanation, confidence}
+        """
+        if self.strategy == "batch":
+            return self._map_batch_strategy(row_pairs, source_lang, target_lang)
+        else:
+            # Default: max_tokens strategy
+            return self._map_max_tokens_strategy(row_pairs, source_lang, target_lang)
 
     def map_text_revision(
         self,
         source_before: str,
         source_after: str,
         target_current: str,
-        source_lang: str = "中文",
-        target_lang: str = "英文"
-    ) -> Dict:
+        source_lang: str = "Chinese",
+        target_lang: str = "English"
+    ) -> Dict[str, Any]:
         """
-        将源语言的文本修订映射到目标语言（使用 Prompt Caching）
+        Convenience method: Map a single revision.
+
+        Wraps in a one-element list and calls map_row_pairs.
 
         Args:
-            source_before: 源语言修订前的完整文本
-            source_after: 源语言修订后的完整文本
-            target_current: 目标语言的当前文本
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
+            source_before: Source text before revision
+            source_after: Source text after revision
+            target_current: Current target text
+            source_lang: Source language name
+            target_lang: Target language name
 
         Returns:
-            {
-                'target_after': 目标语言修订后应该是什么,
-                'explanation': LLM 的解释,
-                'confidence': 置信度 (0-1)
-            }
-
-        优化说明:
-            - system 参数包含固定内容，带 cache_control 标记
-            - messages 参数只包含每行变化的数据
-            - 首次调用创建缓存，后续调用读取缓存，节省约 60% 成本
+            {target_after, explanation, confidence}
         """
-        # 检查是否需要更新缓存的 system prompt
-        # 当语言对变化时，需要重新构建
-        if (self._cached_system_prompt is None or
-            self._cached_source_lang != source_lang or
-            self._cached_target_lang != target_lang):
-            self._cached_system_prompt = self._build_system_prompt(source_lang, target_lang)
-            self._cached_source_lang = source_lang
-            self._cached_target_lang = target_lang
+        row_pairs = [{
+            "row_index": 0,
+            "source_before": source_before,
+            "source_after": source_after,
+            "target_current": target_current,
+        }]
+        results = self.map_row_pairs(row_pairs, source_lang, target_lang)
+        if results:
+            return results[0]
+        return {"target_after": "", "confidence": 0.0, "explanation": "", "error": "no result"}
 
-        # 构建变化的用户消息
-        user_message = self._build_user_message(
-            source_before, source_after, target_current, source_lang, target_lang
-        )
+    # --------------------------------------------------------------------------
+    # max_tokens Strategy: 每次调用顶格输出，正则抢救，剩余行继续下次调用
+    # --------------------------------------------------------------------------
 
-        # 使用 Prompt Caching 调用 API
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=2000,
-            temperature=0.0,  # 确定性输出
-            system=self._cached_system_prompt,  # 固定部分，带缓存标记
-            messages=[{"role": "user", "content": user_message}]  # 变化部分
-        )
-
-        result = self._parse_text_response(response.content[0].text)
-        return result
-
-    def map_row_pairs(
+    def _map_max_tokens_strategy(
         self,
         row_pairs: List[Dict],
-        source_lang: str = "中文",
-        target_lang: str = "英文"
+        source_lang: str,
+        target_lang: str
     ) -> List[Dict]:
         """
-        主入口：处理 extractor 输出的行对列表
+        每次调用 API 都顶格输出到 max_tokens 上限，用正则抢救解析结果。
+        剩余未完成的行进入下一次调用，重复直到所有行都完成。
 
-        Args:
-            row_pairs: extractor.extract_row_pairs() 的输出
-                       每项含 {row_index, source_before, source_after, target_current}
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
-
-        Returns:
-            映射结果列表，每项含：
-            {
-                'row_index': 行号,
-                'target_current': 目标语言当前文本,
-                'target_after': 目标语言修订后文本,
-                'explanation': LLM 的解释,
-                'confidence': 置信度
-            }
+        对于短文档可能一次调用就够；对于长文档会自动分多次调用完成。
         """
-        results = []
+        results_by_row: Dict[int, Dict] = {}
+        pending_rows = row_pairs.copy()
+        target_by_row = {row["row_index"]: row["target_current"] for row in row_pairs}
 
-        for pair in row_pairs:
-            row_idx = pair['row_index']
+        for attempt in range(self.max_retries + 1):
+            if not pending_rows:
+                break
 
-            mapped = self.map_text_revision(
-                source_before=pair['source_before'],
-                source_after=pair['source_after'],
-                target_current=pair['target_current'],
-                source_lang=source_lang,
-                target_lang=target_lang
+            print(f"  [max_tokens] 第 {attempt + 1} 次调用: 发送 {len(pending_rows)} 行，顶格输出...")
+
+            # Build and send
+            system_parts = self._build_batch_system_prompt(source_lang, target_lang)
+            user_message = self._build_batch_user_message(pending_rows)
+
+            response_text, stop_reason = self.client.call_with_cache(
+                system_parts, user_message,
+                max_tokens=self.max_output_tokens, temperature=0.0
             )
 
-            mapped['row_index'] = row_idx
-            mapped['target_current'] = pair['target_current']
-            results.append(mapped)
+            if stop_reason in ("max_tokens", "length"):
+                print(f"  [max_tokens] 达到输出上限，正则抢救已输出内容...")
 
-        return results
+            # Parse: always use regex salvage (works for both complete and truncated)
+            parsed = self._salvage_objects(response_text)
+            parsed = self._normalize_batch_results(parsed)
 
-    def _parse_text_response(self, response_text: str) -> Dict:
-        """解析 LLM 的 JSON 响应"""
-        try:
-            # 提取 JSON 代码块
-            if "```json" in response_text:
-                start = response_text.find("```json") + 7
-                end = response_text.find("```", start)
-                json_str = response_text[start:end].strip()
-            elif "```" in response_text:
-                start = response_text.find("```") + 3
-                end = response_text.find("```", start)
-                json_str = response_text[start:end].strip()
-            else:
-                json_str = response_text.strip()
+            # Drop last object if truncated (likely incomplete)
+            if stop_reason in ("max_tokens", "length") and parsed:
+                dropped = parsed.pop()
+                print(f"  [max_tokens] 丢弃最后一个对象 (row {dropped.get('row_index')})，截断不可信")
 
-            result = json.loads(json_str)
+            # Collect results
+            for item in parsed:
+                item["target_current"] = target_by_row.get(item["row_index"], "")
+                results_by_row[item["row_index"]] = item
 
-            # 验证必要字段
-            if 'target_after' not in result:
-                raise ValueError("响应缺少 target_after 字段")
+            print(f"  [max_tokens] 本轮拿到 {len(parsed)} 个有效结果")
 
-            # 设置默认值
-            if 'confidence' not in result:
-                result['confidence'] = 0.8
-            if 'explanation' not in result:
-                result['explanation'] = ''
+            # Find missing rows
+            done_ids = set(results_by_row.keys())
+            pending_rows = [row for row in pending_rows if row["row_index"] not in done_ids]
 
-            return result
+            if pending_rows:
+                print(f"  [max_tokens] 还剩 {len(pending_rows)} 行未完成，继续下一次调用...")
 
-        except Exception as e:
-            print(f"解析响应失败: {e}")
-            print(f"原始响应: {response_text}")
+        # Return results in input order
+        return [
+            results_by_row[pair["row_index"]]
+            for pair in row_pairs
+            if pair["row_index"] in results_by_row
+        ]
 
-            return {
-                'target_after': '',
-                'confidence': 0.0,
-                'explanation': '',
-                'error': str(e)
-            }
+    # --------------------------------------------------------------------------
+    # batch Strategy: Pre-estimated batches, json.loads parsing
+    # --------------------------------------------------------------------------
 
-    def _build_system_prompt(self, source_lang: str, target_lang: str) -> list:
+    def _map_batch_strategy(
+        self,
+        row_pairs: List[Dict],
+        source_lang: str,
+        target_lang: str
+    ) -> List[Dict]:
         """
-        构建可缓存的系统提示（固定部分）
-
-        使用 Anthropic Prompt Caching 功能：
-        - 将不变的内容（角色、背景、原则、格式、示例）放入 system prompt
-        - 添加 cache_control 标记，让 API 缓存这部分内容
-        - 后续调用只需发送变化的数据，节省约 60% 成本
-
-        Args:
-            source_lang: 源语言名称（如"中文"）
-            target_lang: 目标语言名称（如"英文"）
-
-        Returns:
-            符合 Anthropic API system 参数格式的列表
+        Split rows into pre-estimated batches sized to fit output budget.
+        Each batch should complete without truncation, parsed with json.loads.
         """
-        system_text = f"""你是一个专业的双语法律文档翻译专家。
+        results_by_row: Dict[int, Dict] = {}
+        pending_rows = row_pairs.copy()
+        target_by_row = {row["row_index"]: row["target_current"] for row in row_pairs}
 
-## 任务背景
+        batch_output_limit = int(self.max_output_tokens * self.output_safety_ratio)
 
-一份双语文档中，{source_lang}版本进行了修订。你需要将这些修订同步到{target_lang}版本。
+        for attempt in range(self.max_retries + 1):
+            if not pending_rows:
+                break
 
-## 你的任务
+            batches = self._build_batches(pending_rows, batch_output_limit)
+            print(f"  [batch] Attempt {attempt + 1}: {len(pending_rows)} rows in {len(batches)} batches")
 
-1. 理解{source_lang}从"修订前"到"修订后"发生了什么**语义变化**
-2. 在{target_lang}当前文本的基础上，做**最小的改动**来反映相同的语义变化
-3. 返回{target_lang}修订后的**完整文本**
+            failed_rows: List[Dict] = []
 
-## 重要原则
+            for batch_idx, batch in enumerate(batches):
+                print(f"  [batch] Batch {batch_idx + 1}/{len(batches)}: {len(batch)} rows")
 
-- **语义对应**：翻译是语义对应，不是词汇对应。例如中文删除"正在"，英文可能需要改变时态而非删除某个词
-- **最小改动**：只改必须改的部分，保持其他内容不变
-- **语法正确**：确保修订后的{target_lang}文本语法正确、表达自然
+                batch_results, batch_failed = self._map_single_batch(
+                    batch, source_lang, target_lang
+                )
 
-## 输出格式
+                for item in batch_results:
+                    item["target_current"] = target_by_row.get(item["row_index"], "")
+                    results_by_row[item["row_index"]] = item
 
-请以 JSON 格式返回：
-```json
-{{
-  "target_after": "修订后的{target_lang}完整文本",
-  "explanation": "简要说明你理解的语义变化，以及你在{target_lang}中做了什么改动",
-  "confidence": 0.95
-}}
-```
+                failed_rows.extend(batch_failed)
 
-## 参考示例
+            pending_rows = failed_rows
 
-### 示例 1：时态变化
-- {source_lang}修订前："AI正在改变我们的生活"
-- {source_lang}修订后："AI改变了我们的生活"
-- {target_lang}当前："AI is changing our life"
-- {target_lang}修订后："AI has changed our life"
-- 解释：从进行时变为完成时，英文相应调整时态
+            # Shrink budget for retries (more conservative batching)
+            batch_output_limit = max(
+                200,
+                int(batch_output_limit * self.retry_shrink_ratio)
+            )
 
-### 示例 2：数量修改
-- {source_lang}修订前："协议有效期为一年"
-- {source_lang}修订后："协议有效期为两年"
-- {target_lang}当前："The agreement is valid for one year"
-- {target_lang}修订后："The agreement is valid for two years"
-- 解释：只修改数量词，保持其他部分不变
+            if pending_rows:
+                print(f"  [batch] {len(pending_rows)} rows failed, retrying with smaller batches...")
 
-### 示例 3：法律用语调整
-- {source_lang}修订前："甲方应当支付"
-- {source_lang}修订后："甲方须支付"
-- {target_lang}当前："Party A should pay"
-- {target_lang}修订后："Party A shall pay"
-- 解释：语气从"应当"变为"须"，英文用 shall 表达强制性"""
+        # Return results in input order
+        return [
+            results_by_row[pair["row_index"]]
+            for pair in row_pairs
+            if pair["row_index"] in results_by_row
+        ]
+
+    def _map_single_batch(
+        self,
+        batch: List[Dict],
+        source_lang: str,
+        target_lang: str
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Map a single batch, return (results, failed_rows)."""
+        if not batch:
+            return [], []
+
+        system_parts = self._build_batch_system_prompt(source_lang, target_lang)
+        user_message = self._build_batch_user_message(batch)
+
+        response_text, stop_reason = self.client.call_with_cache(
+            system_parts, user_message, max_tokens=self.max_output_tokens, temperature=0.0
+        )
+
+        # Batch strategy: try json.loads first (should work if budget estimate is correct)
+        parsed = self._parse_batch_response(response_text)
+
+        parsed_ids = {item["row_index"] for item in parsed}
+        batch_ids = {row["row_index"] for row in batch}
+        failed_ids = batch_ids - parsed_ids
+
+        # If truncated, drop last result and mark it as failed
+        if stop_reason in ("max_tokens", "length"):
+            if parsed:
+                last = parsed.pop()
+                parsed_ids.discard(last.get("row_index"))
+                failed_ids.add(last.get("row_index"))
+
+        failed_rows = [row for row in batch if row["row_index"] in failed_ids]
+        return parsed, failed_rows
+
+    def _build_batches(
+        self,
+        rows: List[Dict],
+        output_budget: int
+    ) -> List[List[Dict]]:
+        """Split rows into batches based on estimated output tokens."""
+        batches: List[List[Dict]] = []
+        current: List[Dict] = []
+        used = 0
+
+        for row in rows:
+            cost = self._estimate_row_output_tokens(row)
+            if current and used + cost > output_budget:
+                batches.append(current)
+                current = []
+                used = 0
+            current.append(row)
+            used += cost
+
+        if current:
+            batches.append(current)
+
+        return batches
+
+    def _estimate_row_output_tokens(self, row: Dict) -> int:
+        """Estimate output token cost for a row."""
+        text_len = max(
+            len(row.get("source_before", "")),
+            len(row.get("source_after", "")),
+            len(row.get("target_current", ""))
+        )
+        return int(self.row_base_tokens + self.row_per_char * text_len)
+
+    # --------------------------------------------------------------------------
+    # Prompt Building (shared by both strategies)
+    # --------------------------------------------------------------------------
+
+    def _build_batch_system_prompt(self, source_lang: str, target_lang: str) -> List[Dict]:
+        """Build system prompt for multi-row mapping."""
+        system_text = f"""You are a professional bilingual legal translator.
+
+Task
+- Understand semantic changes from source_before to source_after in {source_lang}
+- Apply minimal necessary changes to target_current in {target_lang}
+- Return the full target_after text
+
+Output format (JSON array only, no extra text)
+Each item must include:
+- row_index (int)
+- target_after (string)
+- confidence (0-1, float)
+- explanation (string, optional)"""
 
         return [
             {
                 "type": "text",
                 "text": system_text,
-                "cache_control": {"type": "ephemeral"}  # 标记为可缓存
+                "cache_control": {"type": "ephemeral"}
             }
         ]
 
-    def _build_user_message(
-        self,
-        source_before: str,
-        source_after: str,
-        target_current: str,
-        source_lang: str,
-        target_lang: str
-    ) -> str:
+    def _build_batch_user_message(self, batch: List[Dict]) -> str:
+        """Build user message for multi-row mapping."""
+        payload = [
+            {
+                "row_index": row["row_index"],
+                "source_before": row["source_before"],
+                "source_after": row["source_after"],
+                "target_current": row["target_current"]
+            }
+            for row in batch
+        ]
+
+        json_text = json.dumps(payload, ensure_ascii=False)
+        return (
+            "Process the following JSON array and return a JSON array of results.\n"
+            "Do not include any text outside the JSON array.\n\n"
+            f"INPUT_JSON:\n{json_text}\n"
+        )
+
+    # --------------------------------------------------------------------------
+    # Response Parsing
+    # --------------------------------------------------------------------------
+
+    def _parse_batch_response(self, response_text: str) -> List[Dict]:
+        """Parse batch response: try json.loads first, fall back to regex salvage."""
+        text = self._strip_code_fence(response_text)
+
+        # Try full JSON parse
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "results" in data:
+                data = data["results"]
+            return self._normalize_batch_results(data)
+        except Exception:
+            pass
+
+        # Fall back to regex salvage
+        salvaged = self._salvage_objects(text)
+        return self._normalize_batch_results(salvaged)
+
+    def _strip_code_fence(self, text: str) -> str:
+        """Remove code fences from response."""
+        if "```" not in text:
+            return text.strip()
+        start = text.find("```")
+        # Skip language identifier (e.g., ```json)
+        newline = text.find("\n", start)
+        if newline != -1:
+            start = newline + 1
+        else:
+            start = start + 3
+        end = text.find("```", start)
+        if end == -1:
+            return text[start:].strip()
+        return text[start:end].strip()
+
+    def _salvage_objects(self, text: str) -> List[Dict]:
         """
-        构建每行变化的用户消息（不缓存）
-
-        只包含每行修订的具体数据，配合缓存的 system prompt 使用。
-
-        Args:
-            source_before: 源语言修订前的文本
-            source_after: 源语言修订后的文本
-            target_current: 目标语言当前文本
-            source_lang: 源语言名称
-            target_lang: 目标语言名称
-
-        Returns:
-            用户消息字符串
+        Regex salvage: extract all complete JSON objects containing row_index.
+        Works on both complete and truncated responses.
         """
-        return f"""## {source_lang}的变化
+        # Strip code fences first
+        text = self._strip_code_fence(text)
 
-**修订前：**
-{source_before}
+        pattern = re.compile(r"\{[^{}]*\"row_index\"\s*:\s*\d+[^{}]*\}")
+        results = []
+        for match in pattern.finditer(text):
+            chunk = match.group(0)
+            try:
+                results.append(json.loads(chunk))
+            except Exception:
+                continue
+        return results
 
-**修订后：**
-{source_after}
+    def _normalize_batch_results(self, data: Any) -> List[Dict]:
+        """Normalize and validate batch results."""
+        if not isinstance(data, list):
+            return []
 
-## {target_lang}当前文本
+        normalized = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if "row_index" not in item or "target_after" not in item:
+                continue
+            item.setdefault("confidence", 0.8)
+            item.setdefault("explanation", "")
+            normalized.append(item)
 
-{target_current}
+        return normalized
 
-请分析语义变化并返回{target_lang}修订后的完整文本。"""
 
-# ============================================================
-# 使用示例
-# ============================================================
+# ================================================================================
+# Convenience Functions
+# ================================================================================
+
+def quick_map(
+    source_before: str,
+    source_after: str,
+    target_current: str,
+    provider: str = "anthropic",
+    source_lang: str = "Chinese",
+    target_lang: str = "English"
+) -> str:
+    """
+    Quick one-liner for single revision mapping.
+
+    Returns the target_after text directly.
+    """
+    mapper = RevisionMapper(provider=provider, strategy="max_tokens")
+    result = mapper.map_text_revision(
+        source_before, source_after, target_current,
+        source_lang, target_lang
+    )
+    return result.get("target_after", "")
+
+
+# ================================================================================
+# Usage Example
+# ================================================================================
 
 if __name__ == "__main__":
-    import os
+    print("=" * 60)
+    print("Unified RevisionMapper Demo")
+    print("=" * 60)
 
-    # 从环境变量获取 API 密钥
+    # Check for API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
-
     if not api_key:
-        print("请设置 ANTHROPIC_API_KEY 环境变量")
-        print("Windows: set ANTHROPIC_API_KEY=your-key-here")
-        print("Linux/Mac: export ANTHROPIC_API_KEY='your-key-here'")
-        exit(1)
+        print("\nNo ANTHROPIC_API_KEY found. Set it to run the demo:")
+        print("  Windows: set ANTHROPIC_API_KEY=your-key-here")
+        print("  Linux/Mac: export ANTHROPIC_API_KEY='your-key-here'")
+        print("\nAvailable providers:")
+        for provider in ["anthropic", "deepseek", "qwen", "doubao", "zhipu", "openai"]:
+            print(f"  - {provider}")
+        print("\nStrategies:")
+        print("  - max_tokens: 每次调用顶格输出，正则抢救 (最快)")
+        print("  - batch: 预估批次大小，json.loads 解析 (最稳定)")
+        exit(0)
 
-    mapper = RevisionMapper(api_key)
+    # Example: max_tokens strategy
+    print("\n--- max_tokens strategy: 每次调用顶格输出 ---")
+    mapper = RevisionMapper(provider="anthropic", strategy="max_tokens")
 
-    # ========== 示例 1：单行映射 ==========
-    print("=" * 60)
-    print("示例 1：单行映射 (map_text_revision)")
-    print("=" * 60)
-
-    source_before = "AI正在改变我们的生活。"
-    source_after = "AI改变了我们的生活。"
-    target_current = "AI is changing our life."
-
-    print(f"\n输入:")
-    print(f"  源语言修订前: {source_before}")
-    print(f"  源语言修订后: {source_after}")
-    print(f"  目标语言当前: {target_current}")
-
-    result = mapper.map_text_revision(
-        source_before=source_before,
-        source_after=source_after,
-        target_current=target_current,
-        source_lang="中文",
-        target_lang="英文"
-    )
-
-    print(f"\n输出:")
-    print(f"  目标语言修订后: {result['target_after']}")
-    print(f"  置信度: {result['confidence']}")
-    print(f"  说明: {result.get('explanation', '')}")
-
-    # ========== 示例 2：批量映射（模拟 extractor 输出）==========
-    print("\n" + "=" * 60)
-    print("示例 2：批量映射 (map_row_pairs)")
-    print("=" * 60)
-
-    # 模拟 extractor.extract_row_pairs() 的输出
     row_pairs = [
         {
-            'row_index': 0,
-            'source_before': '本协议由甲方和乙方签订。',
-            'source_after': '本协议由甲方与乙方签订。',
-            'target_current': 'This agreement is signed by Party A and Party B.'
+            "row_index": 0,
+            "source_before": "The agreement is valid for one year.",
+            "source_after": "The agreement is valid for two years.",
+            "target_current": "The agreement is valid for one year."
         },
         {
-            'row_index': 1,
-            'source_before': '协议有效期为一年。',
-            'source_after': '协议有效期为两年。',
-            'target_current': 'The agreement is valid for one year.'
+            "row_index": 1,
+            "source_before": "Party A should pay.",
+            "source_after": "Party A shall pay.",
+            "target_current": "Party A should pay."
+        },
+        {
+            "row_index": 2,
+            "source_before": "This clause may be amended.",
+            "source_after": "This clause cannot be amended.",
+            "target_current": "This clause may be amended."
         }
     ]
 
-    print(f"\n输入: {len(row_pairs)} 行修订")
+    results = mapper.map_row_pairs(row_pairs, source_lang="English", target_lang="English")
 
-    results = mapper.map_row_pairs(row_pairs, source_lang="中文", target_lang="英文")
-
-    print(f"\n输出:")
     for r in results:
-        print(f"\n  行 {r['row_index']}:")
-        print(f"    当前: {r['target_current']}")
-        print(f"    修订后: {r['target_after']}")
-        print(f"    置信度: {r['confidence']}")
+        print(f"\nRow {r['row_index']}:")
+        print(f"  Current: {r['target_current']}")
+        print(f"  After:   {r['target_after']}")
+        print(f"  Confidence: {r['confidence']}")
