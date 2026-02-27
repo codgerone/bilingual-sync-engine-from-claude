@@ -97,7 +97,6 @@ class LLMClient(ABC):
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         """
@@ -106,7 +105,6 @@ class LLMClient(ABC):
         Args:
             system_prompt: System/instruction prompt
             user_message: User message content
-            max_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0.0 = deterministic)
 
         Returns:
@@ -119,7 +117,6 @@ class LLMClient(ABC):
         self,
         system_prompt_parts: List[Dict],
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         """
@@ -128,7 +125,6 @@ class LLMClient(ABC):
         Args:
             system_prompt_parts: List of prompt parts with cache_control
             user_message: User message content
-            max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
 
         Returns:
@@ -140,21 +136,35 @@ class LLMClient(ABC):
 class AnthropicClient(LLMClient):
     """Anthropic Claude API client."""
 
+    # Anthropic API requires max_tokens, so we use model's max output limit
+    # Source: https://docs.anthropic.com/en/docs/about-claude/models/overview
+    MODEL_MAX_TOKENS = {
+        "claude-opus-4-6": 128000,
+        "claude-sonnet-4-6": 64000,
+        "claude-haiku-4-5-20251001": 64000,
+        "claude-sonnet-4-5-20250929": 64000,
+        "claude-opus-4-5-20251101": 64000,
+        "claude-opus-4-1-20250805": 32000,
+        "claude-sonnet-4-20250514": 64000,
+        "claude-opus-4-20250514": 32000,
+    }
+    DEFAULT_MAX_TOKENS = 64000
+
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
+        self.max_tokens = self.MODEL_MAX_TOKENS.get(model, self.DEFAULT_MAX_TOKENS)
 
     def call(
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=max_tokens,
+            max_tokens=self.max_tokens,
             temperature=temperature,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}]
@@ -165,12 +175,11 @@ class AnthropicClient(LLMClient):
         self,
         system_prompt_parts: List[Dict],
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=max_tokens,
+            max_tokens=self.max_tokens,
             temperature=temperature,
             system=system_prompt_parts,
             messages=[{"role": "user", "content": user_message}]
@@ -201,12 +210,10 @@ class OpenAICompatibleClient(LLMClient):
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         response = self.client.chat.completions.create(
             model=self.model,
-            max_tokens=max_tokens,
             temperature=temperature,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -219,13 +226,12 @@ class OpenAICompatibleClient(LLMClient):
         self,
         system_prompt_parts: List[Dict],
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         # OpenAI-compatible APIs don't support cache_control
         # Combine parts into single system prompt
         system_text = "".join(part.get("text", "") for part in system_prompt_parts)
-        return self.call(system_text, user_message, max_tokens, temperature)
+        return self.call(system_text, user_message, temperature)
 
 
 class WenxinClient(LLMClient):
@@ -261,7 +267,6 @@ class WenxinClient(LLMClient):
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         import requests
@@ -274,7 +279,6 @@ class WenxinClient(LLMClient):
                 {"role": "user", "content": f"{system_prompt}\n\n{user_message}"}
             ],
             "temperature": max(temperature, 0.01),  # Wenxin minimum is 0.01
-            "max_output_tokens": max_tokens
         }
 
         response = requests.post(url, json=payload)
@@ -286,30 +290,39 @@ class WenxinClient(LLMClient):
         self,
         system_prompt_parts: List[Dict],
         user_message: str,
-        max_tokens: int = 2000,
         temperature: float = 0.0
     ) -> Tuple[str, str]:
         system_text = "".join(part.get("text", "") for part in system_prompt_parts)
-        return self.call(system_text, user_message, max_tokens, temperature)
+        return self.call(system_text, user_message, temperature)
 
 
 # ================================================================================
 # LLM Client Factory
 # ================================================================================
 
-def create_llm_client(provider: str, api_key: str, model: str = None) -> LLMClient:
+def create_llm_client(provider: str, api_key: str = None, model: str = None) -> LLMClient:
     """
     Factory function to create LLM clients.
 
     Args:
         provider: Provider name (anthropic, deepseek, qwen, wenxin, doubao, zhipu, openai)
-        api_key: API key (required, obtained from environment variable by caller)
+        api_key: API key (read from environment variable)
         model: Model name (defaults to provider's recommended model)
 
     Returns:
         LLMClient instance
     """
     provider = provider.lower()
+
+    PROVIDER_ENV_KEYS = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "qwen": "QWEN_API_KEY",
+        "wenxin": "WENXIN_API_KEY",
+        "doubao": "DOUBAO_API_KEY",
+        "zhipu": "ZHIPU_API_KEY",
+        "openai": "OPENAI_API_KEY",
+    }
 
     # Provider configurations
     PROVIDERS = {
@@ -352,6 +365,12 @@ def create_llm_client(provider: str, api_key: str, model: str = None) -> LLMClie
         available = ", ".join(PROVIDERS.keys())
         raise ValueError(f"Unknown provider: {provider}. Available: {available}")
 
+    # Read API key from environment variable
+    env_key = PROVIDER_ENV_KEYS[provider]
+    api_key = os.getenv(env_key, "")
+    if not api_key:
+        raise ValueError(f"API key required. Set {env_key} environment variable.")
+
     config = PROVIDERS[provider]
     model = model or config["default_model"]
 
@@ -389,23 +408,11 @@ class RevisionMapper:
         results = mapper.map_row_pairs(row_pairs, source_lang="Chinese", target_lang="English")
     """
 
-    # Provider to environment variable mapping
-    PROVIDER_ENV_KEYS = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-        "qwen": "QWEN_API_KEY",
-        "wenxin": "WENXIN_API_KEY",
-        "doubao": "DOUBAO_API_KEY",
-        "zhipu": "ZHIPU_API_KEY",
-        "openai": "OPENAI_API_KEY",
-    }
-
     def __init__(
         self,
         provider: str = "anthropic",
         model: str = None,
         strategy: str = "max_tokens",
-        max_output_tokens: int = 4096,
         output_safety_ratio: float = 0.7,
         row_base_tokens: int = 80,
         row_per_char: float = 0.2,
@@ -418,7 +425,6 @@ class RevisionMapper:
             provider: LLM provider (anthropic, deepseek, qwen, wenxin, doubao, zhipu, openai)
             model: Model name (or use provider default)
             strategy: "max_tokens" or "batch"
-            max_output_tokens: Max tokens for API call output
             output_safety_ratio: Safety margin for batch output budgeting
             row_base_tokens: Base token cost per row estimate (batch strategy)
             row_per_char: Token cost per character estimate (batch strategy)
@@ -427,21 +433,8 @@ class RevisionMapper:
         self.provider = provider.lower()
         self.strategy = strategy
 
-        # Get API key from environment variable
-        env_key = self.PROVIDER_ENV_KEYS.get(self.provider)
-        if not env_key:
-            available = ", ".join(self.PROVIDER_ENV_KEYS.keys())
-            raise ValueError(f"Unknown provider: {provider}. Available: {available}")
-
-        api_key = os.getenv(env_key, "")
-        if not api_key:
-            raise ValueError(f"API key required. Set {env_key} environment variable.")
-
         # Create LLM client
-        self.client = create_llm_client(self.provider, api_key, model)
-
-        # Output parameters
-        self.max_output_tokens = max_output_tokens
+        self.client = create_llm_client(self.provider, model)
 
         # Batch strategy parameters
         self.output_safety_ratio = output_safety_ratio
@@ -495,7 +488,8 @@ class RevisionMapper:
         对于短文档可能一次调用就够；对于长文档会自动分多次调用完成。
         使用"无进展检测"代替固定重试次数，避免长文档数据丢失。
         """
-        results_by_row: Dict[int, Dict] = {}
+        results = []
+        done_ids = set()
         pending_rows = row_pairs.copy()
         target_by_row = {row["row_index"]: row["target_current"] for row in row_pairs}
 
@@ -514,8 +508,7 @@ class RevisionMapper:
             user_message = self._build_batch_user_message(pending_rows)
 
             response_text, stop_reason = self.client.call_with_cache(
-                system_parts, user_message,
-                max_tokens=self.max_output_tokens, temperature=0.0
+                system_parts, user_message, temperature=0.0
             )
 
             if stop_reason in ("max_tokens", "length"):
@@ -527,12 +520,12 @@ class RevisionMapper:
             # Collect results
             for item in parsed:
                 item["target_current"] = target_by_row.get(item["row_index"], "")
-                results_by_row[item["row_index"]] = item
+                results.append(item)
+                done_ids.add(item["row_index"])
 
             print(f"  [max_tokens] 本轮拿到 {len(parsed)} 个有效结果")
 
             # Find missing rows
-            done_ids = set(results_by_row.keys())
             pending_rows = [row for row in pending_rows if row["row_index"] not in done_ids]
 
             # 检测是否有进展
@@ -548,12 +541,7 @@ class RevisionMapper:
             if pending_rows:
                 print(f"  [max_tokens] 还剩 {len(pending_rows)} 行未完成，继续下一次调用...")
 
-        # Return results in input order
-        return [
-            results_by_row[pair["row_index"]]
-            for pair in row_pairs
-            if pair["row_index"] in results_by_row
-        ]
+        return results
 
     # --------------------------------------------------------------------------
     # batch Strategy: Pre-estimated batches, json.loads parsing
@@ -643,7 +631,7 @@ class RevisionMapper:
         user_message = self._build_batch_user_message(batch)
 
         response_text, stop_reason = self.client.call_with_cache(
-            system_parts, user_message, max_tokens=self.max_output_tokens, temperature=0.0
+            system_parts, user_message, temperature=0.0
         )
 
         # 先尝试 json.loads 直接解析（batch 策略预期输出完整）
